@@ -1,0 +1,3809 @@
+import { useState, useEffect, useRef, useCallback, Fragment } from "react";
+import {
+  Trash2, Plus, X, ArrowUpRightFromCircle, Sprout, MapPin,
+  PenTool, Undo2, Check, Edit3, Copy, ChevronDown, ChevronRight, Pencil,
+  ZoomIn, ZoomOut, Download, Upload, Info, AlertTriangle, Sun, CalendarDays, Map, History, Eye, EyeOff, BookOpen,
+  Image as ImageIcon, Lock, Unlock,
+} from "lucide-react";
+
+const STORAGE_KEY = "garden-planner-v1";
+const FT_TO_PX = 14;
+const GRID_SQUARE_FT = 4; // each square on the reference grid always represents this many real feet
+
+const SOIL_TYPES = {
+  clay: { label: "Clay", swatch: "bg-orange-800", fill: "fill-orange-800", border: "border-orange-900", text: "text-orange-50", chip: "bg-orange-100 text-orange-900 border-orange-300" },
+  sandy: { label: "Sandy", swatch: "bg-amber-500", fill: "fill-amber-500", border: "border-amber-700", text: "text-amber-950", chip: "bg-amber-100 text-amber-900 border-amber-300" },
+  silty: { label: "Silty", swatch: "bg-yellow-600", fill: "fill-yellow-600", border: "border-yellow-800", text: "text-yellow-950", chip: "bg-yellow-100 text-yellow-900 border-yellow-300" },
+  loamy: { label: "Loamy", swatch: "bg-amber-950", fill: "fill-amber-950", border: "border-black", text: "text-amber-50", chip: "bg-amber-100 text-amber-900 border-amber-300" },
+  mixed: { label: "Mixed / combination", swatch: "bg-lime-700", fill: "fill-lime-700", border: "border-lime-900", text: "text-lime-50", chip: "bg-lime-100 text-lime-900 border-lime-300" },
+  potting_mix: { label: "Store-bought potting mix", swatch: "bg-purple-700", fill: "fill-purple-700", border: "border-purple-900", text: "text-purple-50", chip: "bg-purple-100 text-purple-900 border-purple-300" },
+  garden_soil: { label: "Store-bought garden soil", swatch: "bg-teal-700", fill: "fill-teal-700", border: "border-teal-900", text: "text-teal-50", chip: "bg-teal-100 text-teal-900 border-teal-300" },
+  unknown: { label: "Unknown", swatch: "bg-stone-400", fill: "fill-stone-400", border: "border-stone-600", text: "text-stone-900", chip: "bg-stone-200 text-stone-800 border-stone-400" },
+};
+
+const YARD_LOCATIONS = {
+  front: "Front yard",
+  back: "Back yard",
+  side: "Side yard",
+  middle: "Middle / interior of yard",
+  container: "Container / patio",
+  indoor: "Indoor",
+  unknown: "Unknown",
+};
+
+const BED_STRUCTURES = {
+  in_ground: "In-ground",
+  raised_bed: "Raised bed",
+  hugelkultur: "Hugelkultur mound",
+  container_pot: "Container / pot",
+  straw_bale: "Straw bale",
+  keyhole: "Keyhole garden",
+  no_dig: "No-dig / lasagna bed",
+  wicking_bed: "Wicking bed",
+  unknown: "Unknown",
+};
+
+const SUN_EXPOSURES = {
+  full_sun: "Full sun (6+ hrs direct)",
+  part_sun: "Part sun / part shade (3-6 hrs)",
+  full_shade: "Full shade (<3 hrs)",
+  unknown: "Unknown / not tracked yet",
+};
+
+const BED_SHAPES = {
+  rectangle: "Rectangle",
+  circle_oval: "Circle / oval",
+  custom_points: "Custom — draw it yourself",
+};
+
+const USDA_ZONES = (() => {
+  const zones = { unset: "Not set yet", international: "International / not sure (describe below)" };
+  for (let z = 1; z <= 13; z++) {
+    zones[`${z}a`] = `Zone ${z}a`;
+    zones[`${z}b`] = `Zone ${z}b`;
+  }
+  return zones;
+})();
+
+const WATER_NEEDS = {
+  low: "Low (drought-tolerant)",
+  medium: "Medium (regular watering)",
+  high: "High (keep consistently moist)",
+  unknown: "Unknown / not tracked yet",
+};
+
+const TEMP_PREFERENCES = {
+  cold_hardy: "Cold-hardy",
+  average: "Average / no special needs",
+  heat_loving: "Heat-loving",
+  frost_tender: "Frost-tender (protect from cold)",
+  unknown: "Unknown / not tracked yet",
+};
+
+let idCounter = 1;
+const nextId = () => `id-${Date.now()}-${idCounter++}`;
+
+const LIGHT_ZONE_STYLES = {
+  full_sun: { fill: "fill-cyan-300", badge: "bg-cyan-100 text-cyan-800 border-cyan-400" },
+  part_sun: { fill: "fill-blue-400", badge: "bg-blue-100 text-blue-800 border-blue-400" },
+  full_shade: { fill: "fill-indigo-500", badge: "bg-indigo-100 text-indigo-800 border-indigo-400" },
+};
+
+function pointInPolygon(px, py, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y;
+    const xj = poly[j].x, yj = poly[j].y;
+    const intersect = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+// Looks at where a bed's center point falls relative to drawn light zones,
+// and returns the sun exposure of whichever zone contains it (or null if none).
+function suggestSunForBed(bed, zones, ftToPx) {
+  const centerX = bed.x + (bed.widthFt * ftToPx) / 2;
+  const centerY = bed.y + (bed.lengthFt * ftToPx) / 2;
+  for (const zone of zones) {
+    const absPoints = zone.points.map((p) => ({ x: zone.x + p.x * ftToPx, y: zone.y + p.y * ftToPx }));
+    if (pointInPolygon(centerX, centerY, absPoints)) return zone.sunExposure;
+  }
+  return null;
+}
+
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Rough, generalized average frost dates by USDA zone number. Real frost dates vary a lot by
+// microclimate even within one zone — this is a starting point, not a precise local forecast.
+const ZONE_FROST_DATES = {
+  1: { lastFrost: [5, 15], firstFrost: [7, 15] },
+  2: { lastFrost: [5, 1], firstFrost: [8, 15] },
+  3: { lastFrost: [4, 15], firstFrost: [8, 15] },
+  4: { lastFrost: [4, 15], firstFrost: [9, 1] },
+  5: { lastFrost: [3, 30], firstFrost: [9, 15] },
+  6: { lastFrost: [3, 15], firstFrost: [9, 30] },
+  7: { lastFrost: [2, 30], firstFrost: [10, 15] },
+  8: { lastFrost: [2, 15], firstFrost: [10, 31] },
+  9: { lastFrost: [1, 15], firstFrost: [11, 15] },
+  10: { lastFrost: [0, 30], firstFrost: [11, 30] },
+};
+
+// A modest set of common garden plants — anything not matched here just gets manual date fields, no guessing.
+const PLANT_REFERENCE = {
+  tomato: { tolerance: "tender", startIndoorsWks: 6, transplantAfterWks: 2, daysToMaturity: 75, recLight: "full_sun", recWater: "medium" },
+  pepper: { tolerance: "tender", startIndoorsWks: 8, transplantAfterWks: 2, daysToMaturity: 70, recLight: "full_sun", recWater: "medium" },
+  eggplant: { tolerance: "tender", startIndoorsWks: 8, transplantAfterWks: 2, daysToMaturity: 75, recLight: "full_sun", recWater: "medium" },
+  cucumber: { tolerance: "tender", startIndoorsWks: 3, transplantAfterWks: 2, daysToMaturity: 60, recLight: "full_sun", recWater: "high" },
+  squash: { tolerance: "tender", directSowAfterWks: 1, daysToMaturity: 50, recLight: "full_sun", recWater: "medium" },
+  zucchini: { tolerance: "tender", directSowAfterWks: 1, daysToMaturity: 50, recLight: "full_sun", recWater: "medium" },
+  pumpkin: { tolerance: "tender", directSowAfterWks: 1, daysToMaturity: 100, recLight: "full_sun", recWater: "medium" },
+  bean: { tolerance: "tender", directSowAfterWks: 1, daysToMaturity: 55, recLight: "full_sun", recWater: "medium" },
+  corn: { tolerance: "tender", directSowAfterWks: 1, daysToMaturity: 75, recLight: "full_sun", recWater: "medium" },
+  basil: { tolerance: "tender", startIndoorsWks: 6, transplantAfterWks: 2, daysToMaturity: 60, recLight: "full_sun", recWater: "medium" },
+  marigold: { tolerance: "tender", startIndoorsWks: 6, transplantAfterWks: 1, daysToMaturity: 50, recLight: "full_sun", recWater: "low" },
+  sunflower: { tolerance: "tender", directSowAfterWks: 1, daysToMaturity: 80, recLight: "full_sun", recWater: "medium" },
+  pea: { tolerance: "hardy", directSowBeforeWks: 4, daysToMaturity: 60, recLight: "full_sun", recWater: "medium" },
+  spinach: { tolerance: "hardy", directSowBeforeWks: 6, daysToMaturity: 45, recLight: "part_sun", recWater: "medium" },
+  carrot: { tolerance: "hardy", directSowBeforeWks: 3, daysToMaturity: 70, recLight: "full_sun", recWater: "medium" },
+  beet: { tolerance: "hardy", directSowBeforeWks: 3, daysToMaturity: 55, recLight: "full_sun", recWater: "medium" },
+  radish: { tolerance: "hardy", directSowBeforeWks: 4, daysToMaturity: 25, recLight: "full_sun", recWater: "medium" },
+  potato: { tolerance: "hardy", directSowBeforeWks: 2, daysToMaturity: 90, recLight: "full_sun", recWater: "medium" },
+  chard: { tolerance: "hardy", directSowBeforeWks: 2, daysToMaturity: 55, recLight: "full_sun", recWater: "medium" },
+  kale: { tolerance: "hardy", startIndoorsWks: 6, transplantBeforeWks: 3, daysToMaturity: 55, recLight: "full_sun", recWater: "medium" },
+  onion: { tolerance: "hardy", startIndoorsWks: 10, transplantBeforeWks: 4, daysToMaturity: 100, recLight: "full_sun", recWater: "medium" },
+  lettuce: { tolerance: "half_hardy", directSowBeforeWks: 3, daysToMaturity: 50, recLight: "part_sun", recWater: "medium" },
+  broccoli: { tolerance: "half_hardy", startIndoorsWks: 6, transplantBeforeWks: 2, daysToMaturity: 65, recLight: "full_sun", recWater: "medium" },
+  cabbage: { tolerance: "half_hardy", startIndoorsWks: 6, transplantBeforeWks: 2, daysToMaturity: 70, recLight: "full_sun", recWater: "medium" },
+  cilantro: { tolerance: "half_hardy", directSowBeforeWks: 2, daysToMaturity: 50, recLight: "part_sun", recWater: "medium" },
+  parsley: { tolerance: "half_hardy", startIndoorsWks: 8, transplantBeforeWks: 2, daysToMaturity: 70, recLight: "part_sun", recWater: "medium" },
+  strawberry: { perennialNote: "Perennial — plant crowns in early spring or early fall, not tied to frost timing.", recLight: "full_sun", recWater: "medium", recTemp: "average" },
+  blueberry: { perennialNote: "Perennial shrub — best planted in early spring or fall, in acidic soil.", recLight: "full_sun", recWater: "medium", recTemp: "average" },
+  elderberry: { perennialNote: "Perennial shrub — plant dormant bare-root stock in early spring or fall.", recLight: "full_sun", recWater: "medium", recTemp: "cold_hardy" },
+  raspberry: { perennialNote: "Perennial — plant dormant canes in early spring.", recLight: "full_sun", recWater: "medium", recTemp: "cold_hardy" },
+  garlic: { perennialNote: "Usually fall-planted (about 4-6 weeks before your first fall frost) for a summer harvest.", recLight: "full_sun", recWater: "low", recTemp: "cold_hardy" },
+};
+
+// Derives an implied temperature preference from a plant's frost tolerance, when it has one
+// (annual entries) — perennial entries set recTemp explicitly instead, since they don't have "tolerance".
+const TOLERANCE_TO_TEMP = { tender: "frost_tender", half_hardy: "average", hardy: "cold_hardy" };
+
+function getRecommendedNeeds(plantName) {
+  const key = matchPlantReference(plantName);
+  if (!key) return null;
+  const ref = PLANT_REFERENCE[key];
+  return {
+    matchKey: key,
+    light: ref.recLight || "unknown",
+    water: ref.recWater || "unknown",
+    temp: ref.recTemp || TOLERANCE_TO_TEMP[ref.tolerance] || "unknown",
+  };
+}
+
+// Resolves a plant's stored light/water/temp value — if it's the literal "recommended" sentinel,
+// looks up the current best-guess value instead of the raw string, so warnings/comparisons work correctly.
+function resolveNeedValue(rawValue, plantName, field) {
+  if (rawValue !== "recommended") return rawValue;
+  const rec = getRecommendedNeeds(plantName);
+  return rec ? rec[field] : "unknown";
+}
+
+function matchKeyIn(plantName, keys) {
+  const name = (plantName || "").toLowerCase();
+  let best = null;
+  for (const key of keys) {
+    if (name.includes(key) && (!best || key.length > best.length)) best = key;
+  }
+  return best;
+}
+
+function matchPlantReference(plantName) {
+  return matchKeyIn(plantName, Object.keys(PLANT_REFERENCE));
+}
+
+// Perennials (berries, etc.) default to "keep" on year rollover since they don't get replanted each year.
+function isPerennialPlant(plantName) {
+  const key = matchPlantReference(plantName);
+  return !!(key && PLANT_REFERENCE[key].perennialNote);
+}
+
+function addWeeksToDate(monthDay, weeks) {
+  const d = new Date(2001, monthDay[0], monthDay[1]);
+  d.setDate(d.getDate() + weeks * 7);
+  return [d.getMonth(), d.getDate()];
+}
+
+function addDaysToDate(monthDay, days) {
+  const d = new Date(2001, monthDay[0], monthDay[1]);
+  d.setDate(d.getDate() + days);
+  return [d.getMonth(), d.getDate()];
+}
+
+function formatMonthDay(monthDay) {
+  return `${MONTH_NAMES[monthDay[0]]} ${monthDay[1]}`;
+}
+
+// Returns a best-effort, rough planting/harvest suggestion for a plant name given a zone, or null.
+function getPlantingSuggestion(plantName, zoneValue) {
+  const matchKey = matchPlantReference(plantName);
+  if (!matchKey) return null;
+  const ref = PLANT_REFERENCE[matchKey];
+  if (ref.perennialNote) return { matchKey, perennialNote: ref.perennialNote };
+
+  const zoneNum = parseInt(zoneValue, 10);
+  const frost = ZONE_FROST_DATES[zoneNum];
+  if (!zoneValue || zoneValue === "unset" || zoneValue === "international" || !frost) {
+    return { matchKey, note: "Set your zone above (or a zone 1-10) to get suggested dates for this plant." };
+  }
+
+  let startIndoors = null;
+  if (ref.startIndoorsWks) startIndoors = formatMonthDay(addWeeksToDate(frost.lastFrost, -ref.startIndoorsWks));
+
+  let plantOutsideMD = null;
+  if (ref.transplantAfterWks != null) plantOutsideMD = addWeeksToDate(frost.lastFrost, ref.transplantAfterWks);
+  else if (ref.transplantBeforeWks != null) plantOutsideMD = addWeeksToDate(frost.lastFrost, -ref.transplantBeforeWks);
+  else if (ref.directSowBeforeWks != null) plantOutsideMD = addWeeksToDate(frost.lastFrost, -ref.directSowBeforeWks);
+  else if (ref.directSowAfterWks != null) plantOutsideMD = addWeeksToDate(frost.lastFrost, ref.directSowAfterWks);
+
+  const plantOutside = plantOutsideMD ? formatMonthDay(plantOutsideMD) : null;
+
+  let harvest = null;
+  if (plantOutsideMD && ref.daysToMaturity) {
+    const start = formatMonthDay(addDaysToDate(plantOutsideMD, ref.daysToMaturity));
+    const end = formatMonthDay(addDaysToDate(plantOutsideMD, ref.daysToMaturity + 14));
+    harvest = `${start} – ${end}`;
+  }
+
+  return { matchKey, startIndoors, plantOutside, harvest };
+}
+
+const MONTH_PATTERN = /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i;
+
+// Best-effort parse of a free-text date string like "Mar 19" or "Jul 28 – Aug 11" into a month index (0-11).
+// Returns null if the text doesn't start with a recognizable month — those go in an "Unscheduled" bucket
+// rather than being silently dropped or guessed at.
+function parseMonthFromText(text) {
+  if (!text) return null;
+  const match = text.trim().match(MONTH_PATTERN);
+  if (!match) return null;
+  return MONTH_NAMES.findIndex((m) => m.toLowerCase() === match[1].toLowerCase());
+}
+
+function parseDayFromText(text) {
+  if (!text) return 99;
+  const match = text.match(/(\d{1,2})/);
+  return match ? parseInt(match[1], 10) : 99;
+}
+
+// Flattens every plant (in beds and freestanding) into individual timeline events for the calendar tab.
+function buildCalendarEvents(beds, plants) {
+  const events = [];
+  const addEvents = (plant, locationLabel) => {
+    if (plant.plantingStartIndoors) {
+      events.push({ plant, locationLabel, type: "Start indoors", text: plant.plantingStartIndoors, sortDay: parseDayFromText(plant.plantingStartIndoors) });
+    }
+    if (plant.plantingOutside) {
+      events.push({ plant, locationLabel, type: "Plant outside", text: plant.plantingOutside, sortDay: parseDayFromText(plant.plantingOutside) });
+    }
+    if (plant.harvestWindow) {
+      events.push({ plant, locationLabel, type: "Harvest", text: plant.harvestWindow, sortDay: parseDayFromText(plant.harvestWindow) });
+    }
+  };
+  beds.forEach((bed) => bed.plants.forEach((p) => addEvents(p, bed.name)));
+  plants.forEach((p) => addEvents(p, "Freestanding"));
+  return events;
+}
+
+// Every plant in the garden, regardless of whether any planting/harvest data has been entered —
+// used so the calendar can show a plant even with nothing filled in yet, instead of hiding it.
+function getAllPlantEntries(beds, plants) {
+  const entries = [];
+  beds.forEach((bed) => bed.plants.forEach((p) => entries.push({ plant: p, locationLabel: bed.name })));
+  plants.forEach((p) => entries.push({ plant: p, locationLabel: "Freestanding" }));
+  return entries;
+}
+
+const EVENT_TYPE_STYLES = {
+  "Start indoors": "bg-purple-100 text-purple-800 border-purple-300",
+  "Plant outside": "bg-emerald-100 text-emerald-800 border-emerald-300",
+  Harvest: "bg-amber-100 text-amber-800 border-amber-300",
+};
+
+const JOURNAL_TYPES = {
+  harvest: { label: "Harvest", badge: "bg-amber-100 text-amber-800 border-amber-300" },
+  pest: { label: "Pest / disease", badge: "bg-red-100 text-red-800 border-red-300" },
+  expense: { label: "Expense", badge: "bg-blue-100 text-blue-800 border-blue-300" },
+  note: { label: "General note", badge: "bg-stone-100 text-stone-700 border-stone-300" },
+};
+
+const PHASE_COLORS = {
+  indoor: "bg-purple-400",
+  outside: "bg-emerald-400",
+  harvest: "bg-amber-400",
+};
+
+// Shared category filter used by both the List and Gantt views — List events use the full label
+// ("Start indoors"), Gantt phases use the short key ("indoor"); this bridges the two.
+const CATEGORY_TO_PHASE = {
+  "Start indoors": "indoor",
+  "Plant outside": "outside",
+  Harvest: "harvest",
+};
+
+const PHASE_LABELS = {
+  indoor: "Start indoors",
+  outside: "Plant outside",
+  harvest: "Harvest",
+};
+
+const LEGEND_ITEMS = [
+  { label: "Start indoors", classes: "border-purple-300 bg-purple-100 text-purple-800" },
+  { label: "Plant outside", classes: "border-emerald-300 bg-emerald-100 text-emerald-800" },
+  { label: "Harvest", classes: "border-amber-300 bg-amber-100 text-amber-800" },
+];
+
+// Converts a month/day into a 0-51 week-of-year index, using a fixed non-leap reference year.
+function weekOfYear(month, day) {
+  const d = new Date(2001, month, day);
+  const start = new Date(2001, 0, 1);
+  const dayOfYear = Math.round((d - start) / 86400000) + 1;
+  return Math.min(51, Math.max(0, Math.floor((dayOfYear - 1) / 7)));
+}
+
+// Parses a free-text date like "Mar 19" into a week index. Falls back to mid-month (day 15) if
+// a month is found but no day number — still gives a reasonable week, not a crash or a guess at a day.
+function parseDateToWeek(text) {
+  const month = parseMonthFromText(text);
+  if (month === null || month === -1) return null;
+  const dayMatch = text.match(/(\d{1,2})/);
+  const day = dayMatch ? Math.min(28, parseInt(dayMatch[1], 10)) : 15;
+  return weekOfYear(month, day);
+}
+
+// The week index each month "starts" on — used to place month labels along the 52-week header.
+const MONTH_START_WEEKS = MONTH_NAMES.map((_, m) => weekOfYear(m, 1));
+
+// Best-effort week-level phases for a single plant, for the Gantt row. Week precision only —
+// the underlying dates are rough estimates or free text anyway, so day-level bars would be fake precision.
+function getPlantWeekPhases(plant) {
+  const phases = Array(52).fill(null);
+  const indoorWeek = parseDateToWeek(plant.plantingStartIndoors);
+  if (indoorWeek !== null) phases[indoorWeek] = "indoor";
+  const outsideWeek = parseDateToWeek(plant.plantingOutside);
+  if (outsideWeek !== null) phases[outsideWeek] = "outside";
+  if (plant.harvestWindow) {
+    const parts = plant.harvestWindow.split(/[–-]/).map((s) => s.trim());
+    const startWeek = parseDateToWeek(parts[0]);
+    if (startWeek !== null) {
+      const endWeek = parts[1] ? parseDateToWeek(parts[1]) : startWeek;
+      const validEnd = endWeek !== null ? endWeek : startWeek;
+      if (validEnd >= startWeek) {
+        for (let w = startWeek; w <= validEnd; w++) phases[w] = "harvest";
+      } else {
+        phases[startWeek] = "harvest";
+      }
+    }
+  }
+  return phases;
+}
+
+function buildGanttRows(beds, plants) {
+  const rows = [];
+  const unscheduled = [];
+  const addRow = (plant, locationLabel) => {
+    const phases = getPlantWeekPhases(plant);
+    if (phases.some((p) => p !== null)) {
+      rows.push({ plant, locationLabel, phases });
+    } else if (plant.plantingStartIndoors || plant.plantingOutside || plant.harvestWindow) {
+      unscheduled.push({ plant, locationLabel });
+    }
+  };
+  beds.forEach((bed) => bed.plants.forEach((p) => addRow(p, bed.name)));
+  plants.forEach((p) => addRow(p, "Freestanding"));
+  return { rows, unscheduled };
+}
+
+function GanttView({ beds, plants, categoryFilter }) {
+  const { rows, unscheduled } = buildGanttRows(beds, plants);
+
+  if (rows.length === 0) {
+    return (
+      <div className="bg-white border border-stone-300 rounded-xl p-6 text-center text-stone-400 text-sm">
+        Nothing with a recognizable month yet. Add planting or harvest dates on any plant's details (the ⓘ icon) to see it here.
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white border border-stone-300 rounded-xl p-3 overflow-x-auto">
+      <p className="text-xs text-stone-400 mb-2">Scroll sideways to see the full year — each column is one week.</p>
+      <div style={{ minWidth: 140 + 52 * 16 }}>
+        <div className="grid gap-px" style={{ gridTemplateColumns: "140px repeat(52, minmax(16px, 1fr))" }}>
+          <div />
+          {Array.from({ length: 52 }, (_, w) => {
+            const monthIndex = MONTH_START_WEEKS.indexOf(w);
+            return (
+              <div
+                key={w}
+                className={`text-xs mono-label text-stone-400 text-center pb-1 ${monthIndex !== -1 ? "border-l border-stone-300" : ""}`}
+              >
+                {monthIndex !== -1 ? MONTH_NAMES[monthIndex] : ""}
+              </div>
+            );
+          })}
+          {rows.map((row, ri) => (
+            <Fragment key={ri}>
+              <div className="text-xs text-stone-700 pr-2 py-1 truncate" title={`${row.plant.name}${row.plant.cultivar ? ` (${row.plant.cultivar})` : ""} · ${row.locationLabel}`}>
+                <div className="font-medium truncate">{row.plant.name}</div>
+                <div className="text-stone-400 truncate">{row.locationLabel}</div>
+              </div>
+              {row.phases.map((phase, wi) => (
+                <div key={wi} className={`py-1 ${MONTH_START_WEEKS.includes(wi) ? "border-l border-stone-200" : ""}`}>
+                  <div
+                    className={`h-4 rounded-sm ${phase ? PHASE_COLORS[phase] : "bg-stone-100"} ${
+                      categoryFilter && phase && CATEGORY_TO_PHASE[categoryFilter] !== phase ? "opacity-25" : ""
+                    }`}
+                    title={
+                      phase
+                        ? `${row.plant.name}${row.plant.cultivar ? ` (${row.plant.cultivar})` : ""} · ${row.locationLabel} — ${PHASE_LABELS[phase]}`
+                        : ""
+                    }
+                  />
+                </div>
+              ))}
+            </Fragment>
+          ))}
+        </div>
+      </div>
+      {unscheduled.length > 0 && (
+        <p className="text-xs text-stone-400 mt-3 pt-3 border-t border-stone-200">
+          {unscheduled.length} plant{unscheduled.length === 1 ? "" : "s"} with dates that didn't start with a recognizable month aren't shown on this timeline — see the List view for those.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function CalendarView({ beds, plants }) {
+  const [mode, setMode] = useState("list");
+  const [categoryFilter, setCategoryFilter] = useState(null);
+  const events = buildCalendarEvents(beds, plants);
+  const byMonth = Array.from({ length: 12 }, () => []);
+  const unscheduled = [];
+  events.forEach((ev) => {
+    const month = parseMonthFromText(ev.text);
+    if (month === null || month === -1) unscheduled.push(ev);
+    else byMonth[month].push(ev);
+  });
+  byMonth.forEach((list) => list.sort((a, b) => a.sortDay - b.sortDay));
+
+  const noInfoEntries = getAllPlantEntries(beds, plants).filter(
+    (e) => !e.plant.plantingStartIndoors && !e.plant.plantingOutside && !e.plant.harvestWindow
+  );
+
+  const totalScheduled = events.length - unscheduled.length;
+  const fadeClass = (evType) => (categoryFilter && evType !== categoryFilter ? "opacity-25" : "");
+
+  return (
+    <div className="max-w-4xl mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6">
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 className="fraunces text-xl text-stone-800">Your planting & harvest calendar</h2>
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex items-center border border-stone-300 rounded-lg bg-white overflow-hidden text-sm">
+            <button
+              type="button"
+              onClick={() => setMode("list")}
+              className={`px-3 py-1.5 ${mode === "list" ? "bg-emerald-700 text-white" : "text-stone-600 hover:bg-stone-50"}`}
+            >
+              List
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("gantt")}
+              className={`px-3 py-1.5 border-l border-stone-300 ${mode === "gantt" ? "bg-emerald-700 text-white" : "text-stone-600 hover:bg-stone-50"}`}
+            >
+              Gantt
+            </button>
+          </div>
+          <div className="flex items-center gap-1.5 text-xs mono-label">
+            <button
+              type="button"
+              onClick={() => setCategoryFilter(null)}
+              className={`inline-flex items-center gap-1 border rounded-full px-2 py-0.5 transition ${
+                categoryFilter === null
+                  ? "border-stone-500 bg-stone-700 text-white"
+                  : "border-stone-300 bg-white text-stone-500 hover:bg-stone-50"
+              }`}
+            >
+              All
+            </button>
+            {LEGEND_ITEMS.map((item) => (
+              <button
+                key={item.label}
+                type="button"
+                onClick={() => setCategoryFilter(item.label)}
+                className={`inline-flex items-center gap-1 border rounded-full px-2 py-0.5 transition ${item.classes} ${
+                  categoryFilter && categoryFilter !== item.label ? "opacity-40" : ""
+                } ${categoryFilter === item.label ? "ring-2 ring-offset-1 ring-stone-400" : ""}`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {events.length === 0 && noInfoEntries.length === 0 ? (
+        <div className="bg-white border border-stone-300 rounded-xl p-6 text-center text-stone-400 text-sm">
+          Nothing scheduled yet. Add planting or harvest dates on any plant's details (the ⓘ icon) to see it here.
+        </div>
+      ) : (
+        <>
+          {mode === "gantt" ? (
+            <GanttView beds={beds} plants={plants} categoryFilter={categoryFilter} />
+          ) : (
+            <>
+              {events.length > 0 && totalScheduled === 0 && (
+                <p className="text-xs text-stone-500 mb-3">
+                  None of your dates start with a recognizable month name yet — they're all in the "Unscheduled" list below.
+                </p>
+              )}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {MONTH_NAMES.map((monthName, i) => (
+                  <div key={monthName} className="bg-white border border-stone-300 rounded-xl p-3">
+                    <h3 className="fraunces text-base text-stone-700 mb-2">{monthName}</h3>
+                    {byMonth[i].length === 0 ? (
+                      <p className="text-xs text-stone-300 italic">Nothing yet</p>
+                    ) : (
+                      <ul className="space-y-1.5">
+                        {byMonth[i].map((ev, idx) => (
+                          <li key={idx} className={`text-xs transition ${fadeClass(ev.type)}`}>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className={`inline-flex border rounded-full px-1.5 py-0.5 text-xs mono-label ${EVENT_TYPE_STYLES[ev.type]}`}>
+                                {ev.type}
+                              </span>
+                              <span className="text-stone-800 font-medium">{ev.plant.name}</span>
+                              {ev.plant.cultivar && <span className="text-stone-500 italic">({ev.plant.cultivar})</span>}
+                            </div>
+                            <div className="text-stone-500 pl-0.5">
+                              {ev.text} · {ev.locationLabel}
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {unscheduled.length > 0 && (
+                <div className="mt-4 bg-white border border-stone-300 rounded-xl p-3">
+                  <h3 className="fraunces text-base text-stone-700 mb-2">Unscheduled (couldn't tell which month)</h3>
+                  <ul className="space-y-1.5">
+                    {unscheduled.map((ev, idx) => (
+                      <li key={idx} className={`text-xs transition ${fadeClass(ev.type)}`}>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className={`inline-flex border rounded-full px-1.5 py-0.5 text-xs mono-label ${EVENT_TYPE_STYLES[ev.type]}`}>
+                            {ev.type}
+                          </span>
+                          <span className="text-stone-800 font-medium">{ev.plant.name}</span>
+                        </div>
+                        <div className="text-stone-500 pl-0.5">
+                          {ev.text} · {ev.locationLabel}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </>
+          )}
+
+          {noInfoEntries.length > 0 && (
+            <div className="mt-4 bg-white border border-stone-300 rounded-xl p-3">
+              <h3 className="fraunces text-base text-stone-700 mb-2">Not yet scheduled</h3>
+              <p className="text-xs text-stone-400 mb-2">These plants exist in your garden but have no planting or harvest dates entered yet.</p>
+              <ul className="space-y-1">
+                {noInfoEntries.map((e, idx) => (
+                  <li key={idx} className="text-xs text-stone-700">
+                    <span className="font-medium">{e.plant.name}</span>
+                    {e.plant.cultivar && <span className="text-stone-500 italic"> ({e.plant.cultivar})</span>}
+                    <span className="text-stone-400"> · {e.locationLabel}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function HistoryPlantChip({ plant, onSaveNote }) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(plant.historyNote || "");
+
+  if (editing) {
+    return (
+      <div className="w-full border border-stone-300 rounded-lg p-2 bg-white">
+        <div className="text-xs font-medium text-stone-700 mb-1">
+          {plant.name}
+          {plant.cultivar && <span className="text-stone-500 italic"> ({plant.cultivar})</span>}
+        </div>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="How did this one do?"
+          rows={2}
+          className="w-full border border-stone-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-600"
+        />
+        <div className="flex justify-end gap-1.5 mt-1">
+          <button
+            onClick={() => {
+              setText(plant.historyNote || "");
+              setEditing(false);
+            }}
+            className="text-xs px-2 py-1 rounded border border-stone-300 hover:bg-stone-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              onSaveNote(text.trim());
+              setEditing(false);
+            }}
+            className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-800 text-white"
+          >
+            Save
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="inline-flex flex-col items-start max-w-full">
+      <span className="inline-flex items-center gap-1 text-xs bg-stone-100 text-stone-700 rounded-full px-2 py-0.5">
+        {plant.name}
+        {plant.cultivar && <span className="text-stone-500 italic"> ({plant.cultivar})</span>}
+        <button
+          onClick={() => setEditing(true)}
+          className="hover:text-emerald-700 p-0.5 -m-0.5"
+          title={plant.historyNote ? "Edit note" : "Add a note"}
+        >
+          <Pencil size={10} />
+        </button>
+      </span>
+      {plant.historyNote && <p className="text-xs text-stone-500 italic mt-0.5">{plant.historyNote}</p>}
+    </div>
+  );
+}
+
+function HistoryView({ yearHistory, onDeleteEntry, onUpdateYearNotes, onUpdatePlantNote }) {
+  const sorted = [...yearHistory].sort((a, b) => new Date(b.archivedAt) - new Date(a.archivedAt));
+
+  if (sorted.length === 0) {
+    return (
+      <div className="max-w-4xl mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6">
+        <h2 className="fraunces text-xl text-stone-800 mb-4">Garden history</h2>
+        <div className="bg-white border border-stone-300 rounded-xl p-6 text-center text-stone-400 text-sm">
+          No past years archived yet. Use "Start a new year" on the Garden map tab to save a snapshot of what's planted where before clearing your beds for the next season.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-4xl mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6">
+      <h2 className="fraunces text-xl text-stone-800 mb-4">Garden history</h2>
+      <div className="space-y-4">
+        {sorted.map((entry) => {
+          const totalPlants = entry.beds.reduce((sum, b) => sum + b.plants.length, 0) + entry.plants.length;
+          return (
+            <div key={entry.id} className="bg-white border border-stone-300 rounded-xl p-4">
+              <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+                <h3 className="fraunces text-lg text-stone-800">{entry.year}</h3>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-stone-400">
+                    Archived {new Date(entry.archivedAt).toLocaleDateString()}
+                  </span>
+                  <button
+                    onClick={() => onDeleteEntry(entry.id)}
+                    className="text-stone-400 hover:text-red-600 p-1 -m-1"
+                    title="Delete this history entry"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              </div>
+              <p className="text-xs text-stone-400 mb-3">
+                {entry.beds.length} bed{entry.beds.length === 1 ? "" : "s"} · {totalPlants} plant{totalPlants === 1 ? "" : "s"}
+                {entry.zone && entry.zone !== "unset" ? ` · Zone ${USDA_ZONES[entry.zone] || entry.zone}` : ""}
+              </p>
+
+              <div className="mb-3">
+                <label className="text-xs mono-label text-stone-400 block mb-1">Notes on this year overall</label>
+                <textarea
+                  value={entry.yearNotes || ""}
+                  onChange={(e) => onUpdateYearNotes(entry.id, e.target.value)}
+                  placeholder="e.g. Dry summer, watered more than usual. Aphids were bad on the brassicas."
+                  rows={2}
+                  className="w-full border border-stone-300 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                />
+              </div>
+
+              <div className="space-y-2">
+                {entry.beds.map((bed) => (
+                  <div key={bed.id} className="border border-stone-200 rounded-lg p-2.5">
+                    <div className="text-sm font-medium text-stone-700">{bed.name}</div>
+                    <div className="flex flex-wrap gap-1.5 mt-1">
+                      {bed.plants.length === 0 ? (
+                        <span className="text-xs text-stone-300 italic">No plants recorded</span>
+                      ) : (
+                        bed.plants.map((p) => (
+                          <HistoryPlantChip
+                            key={p.id}
+                            plant={p}
+                            onSaveNote={(text) => onUpdatePlantNote(entry.id, bed.id, p.id, text)}
+                          />
+                        ))
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {entry.plants.length > 0 && (
+                  <div className="border border-stone-200 rounded-lg p-2.5">
+                    <div className="text-sm font-medium text-stone-700">Freestanding</div>
+                    <div className="flex flex-wrap gap-1.5 mt-1">
+                      {entry.plants.map((p) => (
+                        <HistoryPlantChip
+                          key={p.id}
+                          plant={p}
+                          onSaveNote={(text) => onUpdatePlantNote(entry.id, null, p.id, text)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function JournalView({ journalEntries, beds, onAddEntry, onDeleteEntry }) {
+  const [type, setType] = useState("harvest");
+  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [bedName, setBedName] = useState("");
+  const [plantName, setPlantName] = useState("");
+  const [amount, setAmount] = useState("");
+  const [notes, setNotes] = useState("");
+  const [filter, setFilter] = useState(null);
+
+  const bedNameOptions = Array.from(new Set(beds.map((b) => b.name)));
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (!notes.trim() && !plantName.trim() && type !== "expense") return;
+    if (type === "expense" && !amount && !notes.trim()) return;
+    onAddEntry({
+      type,
+      date,
+      bedName: bedName.trim(),
+      plantName: plantName.trim(),
+      amount: type === "expense" ? amount : "",
+      notes: notes.trim(),
+    });
+    setPlantName("");
+    setAmount("");
+    setNotes("");
+  }
+
+  const sorted = [...journalEntries].sort((a, b) => new Date(b.date) - new Date(a.date));
+  const filtered = filter ? sorted.filter((e) => e.type === filter) : sorted;
+  const totalExpenses = journalEntries
+    .filter((e) => e.type === "expense" && e.amount)
+    .reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+
+  return (
+    <div className="max-w-4xl mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6">
+      <h2 className="fraunces text-xl text-stone-800 mb-4">Garden journal</h2>
+
+      <div className="bg-white border border-stone-300 rounded-xl p-4 mb-4">
+        <h3 className="fraunces text-base text-stone-700 mb-3">Add an entry</h3>
+        <form onSubmit={handleSubmit} className="space-y-3">
+          <div className="flex flex-wrap gap-2">
+            {Object.entries(JOURNAL_TYPES).map(([key, t]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setType(key)}
+                className={`text-xs px-3 py-1.5 rounded-full border font-medium transition ${
+                  type === key ? t.badge + " ring-2 ring-offset-1 ring-current" : "bg-white text-stone-500 border-stone-300 hover:bg-stone-50"
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs mono-label text-stone-500 block mb-1">Date</label>
+              <input
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+              />
+            </div>
+            {type === "expense" ? (
+              <div>
+                <label className="text-xs mono-label text-stone-500 block mb-1">Amount ($)</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  placeholder="e.g. 24.99"
+                  className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                />
+              </div>
+            ) : (
+              <div>
+                <label className="text-xs mono-label text-stone-500 block mb-1">Plant (optional)</label>
+                <input
+                  value={plantName}
+                  onChange={(e) => setPlantName(e.target.value)}
+                  placeholder="e.g. Tomato"
+                  className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                />
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">Bed (optional)</label>
+            <input
+              value={bedName}
+              onChange={(e) => setBedName(e.target.value)}
+              placeholder="e.g. Front bed 2"
+              list="journal-bed-options"
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            />
+            <datalist id="journal-bed-options">
+              {bedNameOptions.map((n) => (
+                <option key={n} value={n} />
+              ))}
+            </datalist>
+          </div>
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">
+              {type === "harvest" ? "What & how much (e.g. \"3 lbs tomatoes\")" : type === "pest" ? "What you saw" : type === "expense" ? "What it was for" : "Notes"}
+            </label>
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              rows={2}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            />
+          </div>
+          <button type="submit" className="bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-4 py-2 text-sm font-medium">
+            Add entry
+          </button>
+        </form>
+      </div>
+
+      {journalEntries.length === 0 ? (
+        <div className="bg-white border border-stone-300 rounded-xl p-6 text-center text-stone-400 text-sm">
+          No journal entries yet. Log a harvest, a pest sighting, an expense, or just a note above.
+        </div>
+      ) : (
+        <>
+          <div className="flex items-center flex-wrap gap-2 mb-3">
+            <button
+              onClick={() => setFilter(null)}
+              className={`text-xs px-3 py-1 rounded-full border ${!filter ? "bg-stone-800 text-white border-stone-800" : "bg-white text-stone-500 border-stone-300"}`}
+            >
+              All
+            </button>
+            {Object.entries(JOURNAL_TYPES).map(([key, t]) => (
+              <button
+                key={key}
+                onClick={() => setFilter(key)}
+                className={`text-xs px-3 py-1 rounded-full border ${filter === key ? t.badge + " ring-1 ring-current" : "bg-white text-stone-500 border-stone-300"}`}
+              >
+                {t.label}
+              </button>
+            ))}
+            {totalExpenses > 0 && (
+              <span className="ml-auto text-xs mono-label text-stone-500">
+                Total logged expenses: ${totalExpenses.toFixed(2)}
+              </span>
+            )}
+          </div>
+
+          <div className="space-y-2">
+            {filtered.map((entry) => {
+              const t = JOURNAL_TYPES[entry.type] || JOURNAL_TYPES.note;
+              return (
+                <div key={entry.id} className="bg-white border border-stone-300 rounded-xl p-3 flex items-start gap-3">
+                  <span className={`shrink-0 text-xs mono-label px-2 py-0.5 rounded-full border ${t.badge}`}>{t.label}</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs text-stone-400 mono-label">
+                      {new Date(entry.date + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
+                      {entry.bedName && <> · {entry.bedName}</>}
+                      {entry.plantName && <> · {entry.plantName}</>}
+                      {entry.type === "expense" && entry.amount && <> · ${Number(entry.amount).toFixed(2)}</>}
+                    </div>
+                    {entry.notes && <p className="text-sm text-stone-700 mt-0.5">{entry.notes}</p>}
+                  </div>
+                  <button onClick={() => onDeleteEntry(entry.id)} className="shrink-0 text-stone-400 hover:text-red-600 p-1 -m-1" title="Delete entry">
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Traditional companion-planting pairings — this is garden folklore passed down through generations,
+// not rigorously proven science. Treated here as a starting point worth trying, not settled fact.
+// Botanical family groupings, used for crop-rotation warnings — growing the same family in the
+// same bed repeated years running is what actually depletes soil and builds up pests/disease,
+// not just replanting the exact same crop. Common garden guidance, not a hard scientific rule.
+const PLANT_FAMILIES = {
+  tomato: "nightshade", pepper: "nightshade", eggplant: "nightshade", potato: "nightshade",
+  cabbage: "brassica", broccoli: "brassica", kale: "brassica",
+  bean: "legume", pea: "legume",
+  cucumber: "cucurbit", squash: "cucurbit", zucchini: "cucurbit", pumpkin: "cucurbit",
+  onion: "allium", garlic: "allium", chives: "allium",
+  carrot: "umbellifer", dill: "umbellifer", parsley: "umbellifer", cilantro: "umbellifer", fennel: "umbellifer",
+  beet: "amaranth", spinach: "amaranth", chard: "amaranth",
+  lettuce: "aster", marigold: "aster", zinnia: "aster", calendula: "aster", cosmos: "aster", sunflower: "aster", chrysanthemum: "aster",
+  corn: "grass",
+  strawberry: "rose", raspberry: "rose",
+  blueberry: "heath",
+  basil: "mint", mint: "mint", rosemary: "mint", thyme: "mint", sage: "mint", oregano: "mint", lavender: "mint", "lemon balm": "mint", catnip: "mint",
+};
+
+function matchPlantFamily(plantName) {
+  const key = matchKeyIn(plantName, Object.keys(PLANT_FAMILIES));
+  return key ? PLANT_FAMILIES[key] : null;
+}
+
+// Checks whether this plant shares a botanical family with anything grown in a same-named bed
+// in past years — the most recent match wins, since that's the most relevant one to flag.
+function getRotationWarning(bedName, plantName, yearHistory) {
+  const family = matchPlantFamily(plantName);
+  if (!family || !bedName) return null;
+  const sorted = [...yearHistory].sort((a, b) => new Date(b.archivedAt) - new Date(a.archivedAt));
+  for (const entry of sorted) {
+    const pastBed = entry.beds.find((b) => b.name.trim().toLowerCase() === bedName.trim().toLowerCase());
+    if (!pastBed) continue;
+    for (const p of pastBed.plants) {
+      if (matchPlantFamily(p.name) === family) {
+        return { family, year: entry.year, matchedPlant: p.name };
+      }
+    }
+  }
+  return null;
+}
+
+const COMPANION_DATA = {
+  tomato: { good: ["basil", "carrot", "onion", "marigold", "parsley"], bad: ["cabbage", "corn", "fennel", "potato"] },
+  basil: { good: ["tomato", "pepper"], bad: [] },
+  pepper: { good: ["basil", "onion"], bad: ["fennel"] },
+  carrot: { good: ["tomato", "onion", "lettuce", "pea"], bad: ["dill"] },
+  onion: { good: ["tomato", "carrot", "pepper", "lettuce"], bad: ["bean", "pea"] },
+  bean: { good: ["corn", "squash", "cucumber", "carrot"], bad: ["onion", "garlic"] },
+  corn: { good: ["bean", "squash", "cucumber"], bad: ["tomato"] },
+  squash: { good: ["corn", "bean"], bad: ["potato"] },
+  zucchini: { good: ["corn", "bean"], bad: ["potato"] },
+  cucumber: { good: ["bean", "corn", "pea", "radish"], bad: ["potato"] },
+  cabbage: { good: ["onion", "potato", "dill"], bad: ["tomato", "strawberry", "pepper"] },
+  broccoli: { good: ["onion", "dill"], bad: ["tomato", "strawberry"] },
+  potato: { good: ["bean", "corn", "cabbage"], bad: ["tomato", "cucumber", "squash", "pumpkin", "sunflower"] },
+  lettuce: { good: ["carrot", "onion", "radish", "cucumber"], bad: [] },
+  radish: { good: ["cucumber", "lettuce", "pea", "bean"], bad: [] },
+  pea: { good: ["carrot", "radish", "cucumber", "corn"], bad: ["onion", "garlic"] },
+  garlic: { good: ["tomato", "cabbage"], bad: ["bean", "pea"] },
+  strawberry: { good: ["bean", "lettuce", "spinach", "borage"], bad: ["cabbage", "broccoli"] },
+  spinach: { good: ["strawberry", "cabbage"], bad: [] },
+  eggplant: { good: ["bean", "pepper", "thyme"], bad: ["fennel"] },
+
+  // Herbs
+  fennel: { good: [], bad: ["tomato", "pepper", "bean", "carrot", "dill"] },
+  dill: { good: ["cucumber", "cabbage", "lettuce"], bad: ["carrot", "tomato"] },
+  mint: { good: ["cabbage", "tomato"], bad: [] },
+  rosemary: { good: ["cabbage", "bean", "carrot", "sage"], bad: [] },
+  thyme: { good: ["cabbage", "tomato", "eggplant"], bad: [] },
+  sage: { good: ["cabbage", "carrot", "tomato", "rosemary"], bad: ["cucumber"] },
+  oregano: { good: ["cabbage", "cucumber", "pepper"], bad: [] },
+  chives: { good: ["carrot", "tomato", "cucumber"], bad: ["bean", "pea"] },
+  parsley: { good: ["tomato", "carrot"], bad: [] },
+  cilantro: { good: ["spinach", "pea"], bad: [] },
+  lavender: { good: ["cabbage"], bad: [] },
+  "lemon balm": { good: ["tomato", "squash"], bad: [] },
+  catnip: { good: ["squash", "cucumber"], bad: [] },
+  borage: { good: ["tomato", "squash", "strawberry"], bad: [] },
+
+  // Flowers
+  marigold: { good: ["tomato", "pepper", "cucumber", "squash"], bad: [] },
+  nasturtium: { good: ["cucumber", "squash", "tomato", "cabbage"], bad: [] },
+  zinnia: { good: ["cucumber", "squash"], bad: [] },
+  calendula: { good: ["tomato", "cabbage"], bad: [] },
+  cosmos: { good: ["corn", "bean"], bad: [] },
+  sunflower: { good: ["corn", "cucumber"], bad: ["potato"] },
+  petunia: { good: ["bean", "squash"], bad: [] },
+  geranium: { good: ["cabbage", "corn"], bad: [] },
+  chrysanthemum: { good: [], bad: [] },
+};
+
+function matchCompanionKey(plantName) {
+  return matchKeyIn(plantName, Object.keys(COMPANION_DATA));
+}
+
+// Compares one plant against a list of other plants (its neighbors) and returns which of them
+// are traditionally good or bad companions, based on name-matching against COMPANION_DATA.
+function getCompanionRelations(plant, neighborPlants) {
+  const key = matchCompanionKey(plant.name);
+  if (!key) return { key: null, goodNeighbors: [], badNeighbors: [] };
+  const data = COMPANION_DATA[key];
+  const goodNeighbors = [];
+  const badNeighbors = [];
+  neighborPlants.forEach((n) => {
+    const nKey = matchCompanionKey(n.name);
+    if (!nKey || nKey === key) return;
+    const isBad = data.bad.includes(nKey) || (COMPANION_DATA[nKey] && COMPANION_DATA[nKey].bad.includes(key));
+    const isGood = data.good.includes(nKey) || (COMPANION_DATA[nKey] && COMPANION_DATA[nKey].good.includes(key));
+    if (isBad) badNeighbors.push(n.name);
+    else if (isGood) goodNeighbors.push(n.name);
+  });
+  return { key, goodNeighbors, badNeighbors };
+}
+
+function lightMismatch(bedSunExposure, plantLight) {
+  if (!bedSunExposure || !plantLight) return null;
+  if (bedSunExposure === "unknown" || plantLight === "unknown") return null;
+  if (bedSunExposure === plantLight) return null;
+  return `This bed gets ${SUN_EXPOSURES[bedSunExposure]}, but this plant prefers ${SUN_EXPOSURES[plantLight]}.`;
+}
+
+function migratePlant(plant) {
+  if (
+    plant.light && plant.water && plant.temp && plant.cultivar !== undefined &&
+    plant.plantingOutside !== undefined && plant.companionNotes !== undefined &&
+    plant.rotationWarningsDismissed !== undefined
+  ) return plant;
+  return {
+    ...plant,
+    light: plant.light || "unknown",
+    water: plant.water || "unknown",
+    temp: plant.temp || "unknown",
+    cultivar: plant.cultivar || "",
+    plantingStartIndoors: plant.plantingStartIndoors || "",
+    plantingOutside: plant.plantingOutside || "",
+    harvestWindow: plant.harvestWindow || "",
+    companionNotes: plant.companionNotes || "",
+    companionWarningsDismissed: plant.companionWarningsDismissed || false,
+    rotationWarningsDismissed: plant.rotationWarningsDismissed || false,
+  };
+}
+
+function migrateBed(bed) {
+  const migratedPlants = (bed.plants || []).map(migratePlant);
+  // "Irregular" was removed as a shape option (redundant with Custom); fold any existing beds
+  // that still have it into Rectangle, using the square approximation they already had.
+  const shape = bed.shape === "irregular" ? "rectangle" : bed.shape || "rectangle";
+  if (bed.soilType && bed.bedStructure && bed.sunExposure && shape === bed.shape && bed.shape && bed.sunExposureSource) {
+    return bed.plants === migratedPlants ? bed : { ...bed, plants: migratedPlants };
+  }
+  const legacyMap = { clay: "clay", mixed: "mixed", loam: "loamy" };
+  const sunExposure = bed.sunExposure || "unknown";
+  return {
+    ...bed,
+    shape,
+    soilType: bed.soilType || legacyMap[bed.soilZone] || "unknown",
+    yardLocation: bed.yardLocation || "unknown",
+    bedStructure: bed.bedStructure || "unknown",
+    sunExposure,
+    // Existing beds that already had a real value are assumed to be the user's own choice (manual, locked).
+    // Beds still on "Unknown" are left open for the light-zone auto-suggestion to fill in.
+    sunExposureSource: bed.sunExposureSource || (sunExposure === "unknown" ? "unset" : "manual"),
+    approxSqFt: bed.approxSqFt || Math.round((bed.widthFt || 1) * (bed.lengthFt || 1)),
+    customPoints: bed.customPoints || null,
+    plants: migratedPlants,
+  };
+}
+
+function polygonAreaFt(pointsFt) {
+  let sum = 0;
+  for (let i = 0; i < pointsFt.length; i++) {
+    const a = pointsFt[i];
+    const b = pointsFt[(i + 1) % pointsFt.length];
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(sum / 2);
+}
+
+function normalizePoints(pointsPx, ftToPx) {
+  if (pointsPx.length === 0) return { points: [], widthFt: 1, lengthFt: 1, approxSqFt: 1 };
+  const xs = pointsPx.map((p) => p.x);
+  const ys = pointsPx.map((p) => p.y);
+  const minX = Math.min(...xs);
+  const minY = Math.min(...ys);
+  const maxX = Math.max(...xs);
+  const maxY = Math.max(...ys);
+  const pointsFt = pointsPx.map((p) => ({
+    x: Math.round(((p.x - minX) / ftToPx) * 10) / 10,
+    y: Math.round(((p.y - minY) / ftToPx) * 10) / 10,
+  }));
+  const widthFt = Math.max(1, Math.round(((maxX - minX) / ftToPx) * 10) / 10);
+  const lengthFt = Math.max(1, Math.round(((maxY - minY) / ftToPx) * 10) / 10);
+  const approxSqFt = Math.max(1, Math.round(polygonAreaFt(pointsFt)));
+  return { points: pointsFt, widthFt, lengthFt, approxSqFt };
+}
+
+// Turns a working bed-form-like object into final stored dimensions.
+function computeDimensions(v) {
+  if (v.shape === "custom_points") {
+    // Custom shapes are created/edited directly on the map now (see finishCanvasDraw) — this branch just
+    // preserves whatever shape data already exists when other fields are saved without touching the shape.
+    return {
+      widthFt: Number(v.width) || 1,
+      lengthFt: Number(v.length) || 1,
+      approxSqFt: Number(v.approxSqFt) || 1,
+      customPoints: v.existingCustomPoints || null,
+    };
+  }
+  const widthFt = Math.max(1, Number(v.width) || 1);
+  const lengthFt = Math.max(1, Number(v.length) || 1);
+  return { widthFt, lengthFt, approxSqFt: Math.round(widthFt * lengthFt), customPoints: null };
+}
+
+function bedToFormValues(bed) {
+  return {
+    name: bed.name,
+    shape: bed.shape,
+    width: bed.widthFt,
+    length: bed.lengthFt,
+    approxSqFt: bed.approxSqFt,
+    existingCustomPoints: bed.shape === "custom_points" ? bed.customPoints : null,
+    soilType: bed.soilType,
+    yardLocation: bed.yardLocation,
+    bedStructure: bed.bedStructure,
+    sunExposure: bed.sunExposure,
+    sunExposureSource: bed.sunExposureSource || (bed.sunExposure === "unknown" ? "unset" : "manual"),
+  };
+}
+
+const blankFormValues = () => ({
+  name: "",
+  shape: "rectangle",
+  width: 4,
+  length: 8,
+  approxSqFt: 20,
+  existingCustomPoints: null,
+  soilType: "unknown",
+  yardLocation: "unknown",
+  bedStructure: "unknown",
+  sunExposure: "unknown",
+  sunExposureSource: "unset",
+});
+
+// Shared field set used by both the "Add a bed" sidebar form and the edit modal.
+function BedFields({ values, setValues, onDrawShape, hasCustomShape, nameError }) {
+  const [showMore, setShowMore] = useState(false);
+  const set = (patch) => setValues((v) => ({ ...v, ...patch }));
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <label className="text-xs mono-label text-stone-500 block mb-1">Bed name</label>
+        <input
+          value={values.name}
+          onChange={(e) => set({ name: e.target.value })}
+          placeholder="e.g. Front bed 2"
+          className={`w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 ${
+            nameError ? "border-red-400 focus:ring-red-400" : "border-stone-300 focus:ring-emerald-600"
+          }`}
+        />
+        {nameError && <p className="text-xs text-red-600 mt-1">Give this bed a name before adding it.</p>}
+      </div>
+
+      <div>
+        <label className="text-xs mono-label text-stone-500 block mb-1">Bed shape</label>
+        <select
+          value={values.shape}
+          onChange={(e) => set({ shape: e.target.value })}
+          className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+        >
+          {Object.entries(BED_SHAPES).map(([key, label]) => (
+            <option key={key} value={key}>{label}</option>
+          ))}
+        </select>
+        {values.shape !== "custom_points" && (
+          <p className="text-xs text-stone-400 mt-1">
+            Circle/oval shapes show as an approximate outline. Pick "Custom" to trace exact points directly on the map.
+          </p>
+        )}
+      </div>
+
+      {values.shape === "custom_points" ? (
+        <div>
+          {hasCustomShape && (
+            <p className="text-xs text-stone-500 mb-1.5">
+              Current shape: ~{values.approxSqFt} sq ft · {values.width}ft × {values.length}ft box
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={onDrawShape}
+            className="w-full flex items-center justify-center gap-2 border border-emerald-700 text-emerald-700 rounded-lg py-2 text-sm font-medium hover:bg-emerald-50"
+          >
+            <PenTool size={15} />
+            {hasCustomShape ? "Edit shape on the map" : "Draw shape on the map"}
+          </button>
+          {!hasCustomShape && (
+            <p className="text-xs text-stone-400 mt-1.5">
+              Click directly on "Your land" below to place corner points, then click Finish when done.
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">
+              {values.shape === "circle_oval" ? "Diameter, side A (ft)" : "Width (ft)"}
+            </label>
+            <input
+              type="number"
+              min="1"
+              value={values.width}
+              onChange={(e) => set({ width: e.target.value })}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            />
+          </div>
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">
+              {values.shape === "circle_oval" ? "Diameter, side B (ft)" : "Length (ft)"}
+            </label>
+            <input
+              type="number"
+              min="1"
+              value={values.length}
+              onChange={(e) => set({ length: e.target.value })}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            />
+          </div>
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={() => setShowMore((s) => !s)}
+        className="flex items-center gap-1 text-xs text-emerald-700 hover:text-emerald-800 font-medium pt-1"
+      >
+        {showMore ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        Additional details (soil, location, structure, sun)
+      </button>
+
+      {showMore && (
+        <div className="space-y-3 border-l-2 border-stone-200 pl-3">
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">Soil type</label>
+            <select
+              value={values.soilType}
+              onChange={(e) => set({ soilType: e.target.value })}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              {Object.entries(SOIL_TYPES).map(([key, s]) => (
+                <option key={key} value={key}>{s.label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">Yard location</label>
+            <select
+              value={values.yardLocation}
+              onChange={(e) => set({ yardLocation: e.target.value })}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              {Object.entries(YARD_LOCATIONS).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">Bed structure</label>
+            <select
+              value={values.bedStructure}
+              onChange={(e) => set({ bedStructure: e.target.value })}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              {Object.entries(BED_STRUCTURES).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">
+              Sun exposure {values.sunExposureSource === "auto" && <span className="text-emerald-600 normal-case">(auto-detected from your light zones)</span>}
+            </label>
+            <select
+              value={values.sunExposure}
+              onChange={(e) =>
+                set({ sunExposure: e.target.value, sunExposureSource: e.target.value === "unknown" ? "unset" : "manual" })
+              }
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              {Object.entries(SUN_EXPOSURES).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+            {values.sunExposureSource === "auto" && (
+              <p className="text-xs text-stone-400 mt-1">Changing this yourself will lock it in — it'll stop following the light zones.</p>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PlantDetailsModal({ plantName, initialValues, zone, neighborPlants, bedName, yearHistory, onCancel, onSave }) {
+  const [light, setLight] = useState(initialValues.light || "unknown");
+  const [water, setWater] = useState(initialValues.water || "unknown");
+  const [temp, setTemp] = useState(initialValues.temp || "unknown");
+  const [cultivar, setCultivar] = useState(initialValues.cultivar || "");
+  const [companionNotes, setCompanionNotes] = useState(initialValues.companionNotes || "");
+  const [companionWarningsDismissed, setCompanionWarningsDismissed] = useState(initialValues.companionWarningsDismissed || false);
+  const [rotationWarningsDismissed, setRotationWarningsDismissed] = useState(initialValues.rotationWarningsDismissed || false);
+
+  const suggestion = getPlantingSuggestion(plantName, zone);
+  const [plantingStartIndoors, setPlantingStartIndoors] = useState(
+    initialValues.plantingStartIndoors || suggestion?.startIndoors || ""
+  );
+  const [plantingOutside, setPlantingOutside] = useState(initialValues.plantingOutside || suggestion?.plantOutside || "");
+  const [harvestWindow, setHarvestWindow] = useState(initialValues.harvestWindow || suggestion?.harvest || "");
+
+  const hasStoredTiming = initialValues.plantingStartIndoors || initialValues.plantingOutside || initialValues.harvestWindow;
+  const companion = getCompanionRelations({ name: plantName }, neighborPlants || []);
+  const companionRef = companion.key ? COMPANION_DATA[companion.key] : null;
+  const recommended = getRecommendedNeeds(plantName);
+  const rotationWarning = bedName ? getRotationWarning(bedName, plantName, yearHistory || []) : null;
+
+  const LIGHT_OPTIONS = { recommended: "Recommended (based on plant type)", ...SUN_EXPOSURES };
+  const WATER_OPTIONS = { recommended: "Recommended (based on plant type)", ...WATER_NEEDS };
+  const TEMP_OPTIONS = { recommended: "Recommended (based on plant type)", ...TEMP_PREFERENCES };
+
+  const recommendedHint = (field, label) => {
+    if (!recommended) return <p className="text-xs text-stone-400 mt-1">No general recommendation for this plant name — pick a value yourself.</p>;
+    return <p className="text-xs text-emerald-700 mt-1">→ {label[recommended[field]]}, typical for {recommended.matchKey}.</p>;
+  };
+
+  return (
+    <div className="fixed inset-0 bg-stone-900/60 flex items-start sm:items-center justify-center z-50 p-2 sm:p-4 overflow-y-auto">
+      <div className="bg-white rounded-xl shadow-xl max-w-md w-full p-4 sm:p-5 my-4 sm:my-8">
+        <h3 className="fraunces text-xl flex items-center gap-2 mb-1">
+          <Sprout size={18} className="text-emerald-700" /> {plantName}
+        </h3>
+        <p className="text-xs text-stone-500 mb-3">Plant-specific needs, separate from the bed it's sitting in.</p>
+        <div className="space-y-3">
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">Cultivar / variety (optional)</label>
+            <input
+              value={cultivar}
+              onChange={(e) => setCultivar(e.target.value)}
+              placeholder="e.g. Cherokee Purple, Brandywine"
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            />
+          </div>
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">Light needs</label>
+            <select
+              value={light}
+              onChange={(e) => setLight(e.target.value)}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              {Object.entries(LIGHT_OPTIONS).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+            {light === "recommended" && recommendedHint("light", SUN_EXPOSURES)}
+          </div>
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">Water needs</label>
+            <select
+              value={water}
+              onChange={(e) => setWater(e.target.value)}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              {Object.entries(WATER_OPTIONS).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+            {water === "recommended" && recommendedHint("water", WATER_NEEDS)}
+          </div>
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">Temperature preference</label>
+            <select
+              value={temp}
+              onChange={(e) => setTemp(e.target.value)}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              {Object.entries(TEMP_OPTIONS).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+            {temp === "recommended" && recommendedHint("temp", TEMP_PREFERENCES)}
+          </div>
+
+          <div className="border-t border-stone-200 pt-3">
+            <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">Planting & harvest timing</div>
+            {!hasStoredTiming && suggestion?.perennialNote && (
+              <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-2 mb-2">
+                {suggestion.perennialNote}
+              </p>
+            )}
+            {!hasStoredTiming && suggestion?.note && (
+              <p className="text-xs text-stone-500 bg-stone-50 border border-stone-200 rounded-lg px-2.5 py-2 mb-2">{suggestion.note}</p>
+            )}
+            {!hasStoredTiming && suggestion && !suggestion.perennialNote && !suggestion.note && (
+              <p className="text-xs text-stone-500 mb-2">
+                Rough starting point below, based on typical timing for "{suggestion.matchKey}" and your zone's average frost dates —
+                not precise to your exact location. Edit any of it freely.
+              </p>
+            )}
+            {!hasStoredTiming && !suggestion && (
+              <p className="text-xs text-stone-400 mb-2">No general timing data for this plant name — enter your own dates below.</p>
+            )}
+            <div className="space-y-2">
+              <div>
+                <label className="text-xs mono-label text-stone-500 block mb-1">Start indoors</label>
+                <input
+                  value={plantingStartIndoors}
+                  onChange={(e) => setPlantingStartIndoors(e.target.value)}
+                  placeholder="e.g. Mar 1 (leave blank if direct-sown)"
+                  className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                />
+              </div>
+              <div>
+                <label className="text-xs mono-label text-stone-500 block mb-1">Plant outside / direct sow</label>
+                <input
+                  value={plantingOutside}
+                  onChange={(e) => setPlantingOutside(e.target.value)}
+                  placeholder="e.g. May 10"
+                  className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                />
+              </div>
+              <div>
+                <label className="text-xs mono-label text-stone-500 block mb-1">Harvest window</label>
+                <input
+                  value={harvestWindow}
+                  onChange={(e) => setHarvestWindow(e.target.value)}
+                  placeholder="e.g. Jul 20 – Aug 5"
+                  className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="border-t border-stone-200 pt-3">
+            <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">Companion planting</div>
+            <p className="text-xs text-stone-400 mb-2">
+              Traditional garden pairings passed down through generations — not rigorously proven science, just a starting point worth trying.
+            </p>
+            {!companion.key && (
+              <p className="text-xs text-stone-400 mb-2">No companion-planting data for this plant name.</p>
+            )}
+            {companion.key && (
+              <div className="space-y-1.5 mb-2">
+                {companion.goodNeighbors.length > 0 && (
+                  <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-2">
+                    Grows well near, and currently has: {companion.goodNeighbors.join(", ")}
+                  </p>
+                )}
+                {companion.badNeighbors.length > 0 && (
+                  <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-2.5 py-2">
+                    Traditionally avoided near, but currently has: {companion.badNeighbors.join(", ")}
+                  </p>
+                )}
+                {companionRef && (companionRef.good.length > 0 || companionRef.bad.length > 0) && (
+                  <p className="text-xs text-stone-500">
+                    {companionRef.good.length > 0 && <>Generally good with: {companionRef.good.join(", ")}. </>}
+                    {companionRef.bad.length > 0 && <>Generally avoid: {companionRef.bad.join(", ")}.</>}
+                  </p>
+                )}
+              </div>
+            )}
+            <div className="mb-2">
+              <label className="text-xs mono-label text-stone-500 block mb-1">Your own notes (optional)</label>
+              <textarea
+                value={companionNotes}
+                onChange={(e) => setCompanionNotes(e.target.value)}
+                placeholder="e.g. Planted next to cabbage anyway, seemed fine last year"
+                rows={2}
+                className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+              />
+            </div>
+            <label className="flex items-center gap-2 text-xs text-stone-600">
+              <input
+                type="checkbox"
+                checked={companionWarningsDismissed}
+                onChange={(e) => setCompanionWarningsDismissed(e.target.checked)}
+                className="rounded border-stone-300"
+              />
+              Don't warn me about companion conflicts for this plant
+            </label>
+          </div>
+
+          {bedName && (
+            <div className="border-t border-stone-200 pt-3">
+              <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">Crop rotation</div>
+              {rotationWarning ? (
+                <p className="text-xs text-orange-700 bg-orange-50 border border-orange-200 rounded-lg px-2.5 py-2 mb-2">
+                  You grew {rotationWarning.matchedPlant} (also a {rotationWarning.family}) in this bed in {rotationWarning.year}.
+                  Rotating away from the same family helps avoid depleting the soil and building up pests here.
+                </p>
+              ) : (
+                <p className="text-xs text-stone-400 mb-2">No rotation conflicts found for this bed's history.</p>
+              )}
+              <label className="flex items-center gap-2 text-xs text-stone-600">
+                <input
+                  type="checkbox"
+                  checked={rotationWarningsDismissed}
+                  onChange={(e) => setRotationWarningsDismissed(e.target.checked)}
+                  className="rounded border-stone-300"
+                />
+                Don't warn me about crop rotation for this plant
+              </label>
+            </div>
+          )}
+        </div>
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onCancel} className="text-sm px-4 py-2 rounded-lg border border-stone-300 hover:bg-stone-50">
+            Cancel
+          </button>
+          <button
+            onClick={() =>
+              onSave({
+                light,
+                water,
+                temp,
+                cultivar: cultivar.trim(),
+                plantingStartIndoors: plantingStartIndoors.trim(),
+                plantingOutside: plantingOutside.trim(),
+                harvestWindow: harvestWindow.trim(),
+                companionNotes: companionNotes.trim(),
+                companionWarningsDismissed,
+                rotationWarningsDismissed,
+              })
+            }
+            className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white"
+          >
+            <Check size={15} /> Save changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CalibrationModal({ session, onCancel, onConfirm }) {
+  const [points, setPoints] = useState(session.points);
+  const [referenceFt, setReferenceFt] = useState(session.referenceFt);
+  const imgRef = useRef(null);
+
+  const DISPLAY_MAX = 560;
+  const displayScale = Math.min(DISPLAY_MAX / session.naturalWidth, DISPLAY_MAX / session.naturalHeight, 1);
+  const displayWidth = session.naturalWidth * displayScale;
+  const displayHeight = session.naturalHeight * displayScale;
+
+  function handleClick(e) {
+    if (points.length >= 2) return;
+    const rect = imgRef.current.getBoundingClientRect();
+    const displayX = e.clientX - rect.left;
+    const displayY = e.clientY - rect.top;
+    // Store in the image's own native pixel space, not display space, so the math is resolution-independent.
+    const nativeX = displayX / displayScale;
+    const nativeY = displayY / displayScale;
+    setPoints((prev) => [...prev, { x: nativeX, y: nativeY }]);
+  }
+
+
+  return (
+    <div className="fixed inset-0 bg-stone-900/70 flex items-start sm:items-center justify-center z-50 p-2 sm:p-4 overflow-y-auto">
+      <div className="bg-white rounded-xl shadow-xl max-w-2xl w-full p-4 sm:p-5 my-4 sm:my-8">
+        <h3 className="fraunces text-xl flex items-center gap-2 mb-1">
+          <ImageIcon size={18} className="text-emerald-700" /> Calibrate your image
+        </h3>
+        <p className="text-xs text-stone-500 mb-3">
+          Click two points on something you know the real length of — a driveway edge, a fence line, the side of a
+          building — then tell us how many feet that actually is. This is what lets your traced beds line up with
+          real-world measurements.
+        </p>
+        <div
+          ref={imgRef}
+          onClick={handleClick}
+          className="relative mx-auto border border-stone-300 rounded-lg overflow-hidden bg-stone-100"
+          style={{ width: displayWidth, height: displayHeight, cursor: points.length < 2 ? "crosshair" : "default" }}
+        >
+          <img src={session.dataUrl} alt="Uploaded reference" className="absolute inset-0 w-full h-full object-cover pointer-events-none" draggable={false} />
+          <svg className="absolute inset-0 pointer-events-none" width={displayWidth} height={displayHeight}>
+            {points.length === 2 && (
+              <line
+                x1={points[0].x * displayScale}
+                y1={points[0].y * displayScale}
+                x2={points[1].x * displayScale}
+                y2={points[1].y * displayScale}
+                stroke="rgb(16,185,129)"
+                strokeWidth="2.5"
+                strokeDasharray="5 4"
+              />
+            )}
+            {points.map((p, i) => (
+              <circle key={i} cx={p.x * displayScale} cy={p.y * displayScale} r="6" fill="rgb(16,185,129)" stroke="white" strokeWidth="2" />
+            ))}
+          </svg>
+        </div>
+        <div className="flex items-center justify-between mt-2">
+          <p className="text-xs text-stone-400">
+            {points.length === 0 && "Click your first point."}
+            {points.length === 1 && "Click your second point."}
+            {points.length === 2 && "Line placed — enter its real length below."}
+          </p>
+          {points.length > 0 && (
+            <button onClick={() => setPoints([])} className="text-xs text-stone-500 hover:text-stone-800 underline">
+              Redo points
+            </button>
+          )}
+        </div>
+
+        {points.length === 2 && (
+          <div className="mt-3 flex items-end gap-3">
+            <div className="flex-1">
+              <label className="text-xs mono-label text-stone-500 block mb-1">Real length of that line (feet)</label>
+              <input
+                type="number"
+                min="0.1"
+                step="0.1"
+                autoFocus
+                value={referenceFt}
+                onChange={(e) => setReferenceFt(e.target.value)}
+                placeholder="e.g. 20"
+                className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+              />
+            </div>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onCancel} className="text-sm px-4 py-2 rounded-lg border border-stone-300 hover:bg-stone-50">
+            Cancel
+          </button>
+          <button
+            onClick={() => onConfirm(referenceFt, points, session.dataUrl, session.naturalWidth, session.naturalHeight)}
+            disabled={points.length < 2 || !referenceFt || Number(referenceFt) <= 0}
+            className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-40"
+          >
+            <Check size={15} /> Place on map
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function YearRolloverModal({ beds, plants, onCancel, onConfirm }) {
+  const [yearLabel, setYearLabel] = useState(String(new Date().getFullYear() - 1));
+  const allEntries = getAllPlantEntries(beds, plants);
+  const [kept, setKept] = useState(() => {
+    const initial = {};
+    allEntries.forEach((e) => {
+      initial[e.plant.id] = isPerennialPlant(e.plant.name);
+    });
+    return initial;
+  });
+
+  const toggle = (id) => setKept((prev) => ({ ...prev, [id]: !prev[id] }));
+  const keptCount = Object.values(kept).filter(Boolean).length;
+
+  return (
+    <div className="fixed inset-0 bg-stone-900/60 flex items-start sm:items-center justify-center z-50 p-2 sm:p-4 overflow-y-auto">
+      <div className="bg-white rounded-xl shadow-xl max-w-lg w-full p-4 sm:p-5 my-4 sm:my-8">
+        <h3 className="fraunces text-xl flex items-center gap-2 mb-1">
+          <CalendarDays size={18} className="text-emerald-700" /> Start a new year
+        </h3>
+        <p className="text-xs text-stone-500 mb-3">
+          This saves a snapshot of everything currently in your garden — beds, plants, and all — into History under
+          the year label below (the year you're closing out, not the one ahead). Then it clears your beds for the
+          new season, except for whatever you check to keep (perennials are pre-checked, since they don't get
+          replanted each year).
+        </p>
+        <div className="mb-3">
+          <label className="text-xs mono-label text-stone-500 block mb-1">Year label</label>
+          <input
+            value={yearLabel}
+            onChange={(e) => setYearLabel(e.target.value)}
+            placeholder="e.g. 2026"
+            className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+          />
+        </div>
+
+        <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">
+          Keep these {allEntries.length} plant{allEntries.length === 1 ? "" : "s"} in your beds ({keptCount} selected)
+        </div>
+        {allEntries.length === 0 ? (
+          <p className="text-xs text-stone-400 mb-2">No plants to carry over — your garden is currently empty.</p>
+        ) : (
+          <div className="max-h-60 overflow-y-auto border border-stone-200 rounded-lg divide-y divide-stone-100">
+            {allEntries.map((e) => (
+              <label key={e.plant.id} className="flex items-center gap-2 px-2.5 py-1.5 text-sm hover:bg-stone-50 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={!!kept[e.plant.id]}
+                  onChange={() => toggle(e.plant.id)}
+                  className="rounded border-stone-300"
+                />
+                <span className="text-stone-800">{e.plant.name}</span>
+                {e.plant.cultivar && <span className="text-stone-500 italic">({e.plant.cultivar})</span>}
+                <span className="text-stone-400 ml-auto">{e.locationLabel}</span>
+              </label>
+            ))}
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onCancel} className="text-sm px-4 py-2 rounded-lg border border-stone-300 hover:bg-stone-50">
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              const keptIds = new Set(Object.keys(kept).filter((id) => kept[id]));
+              onConfirm(yearLabel, keptIds);
+            }}
+            className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white"
+          >
+            <Check size={15} /> Archive & start new year
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BedCard({
+  bed,
+  lightZones,
+  renaming,
+  setRenaming,
+  renameInputRef,
+  commitRename,
+  startRename,
+  bedPlantInputs,
+  setBedPlantInputs,
+  addPlantToBed,
+  ejectPlantFromBed,
+  deletePlantFromBed,
+  setEditingPlant,
+  setEditingBed,
+  startCanvasDrawForBedShape,
+  duplicateBed,
+  deleteBed,
+  startDrag,
+  startResizeDrag,
+  yearHistory,
+  clearBedHistory,
+}) {
+  const [hovering, setHovering] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const showDetails = hovering || pinned;
+
+  const soil = SOIL_TYPES[bed.soilType] || SOIL_TYPES.unknown;
+  const locationLabel = YARD_LOCATIONS[bed.yardLocation] || YARD_LOCATIONS.unknown;
+  const structureLabel = BED_STRUCTURES[bed.bedStructure] || BED_STRUCTURES.unknown;
+  const sunLabel = SUN_EXPOSURES[bed.sunExposure] || SUN_EXPOSURES.unknown;
+  const liveSuggestion = suggestSunForBed(bed, lightZones, FT_TO_PX);
+  const suggestionDiffers =
+    liveSuggestion && bed.sunExposureSource === "manual" && liveSuggestion !== bed.sunExposure
+      ? `The light zones on your map suggest ${SUN_EXPOSURES[liveSuggestion]} here, but you've manually set this bed to ${sunLabel}.`
+      : null;
+  const isCustom = bed.shape === "custom_points" && bed.customPoints && bed.customPoints.length >= 3;
+  const hasHistoryForThisBed = yearHistory.some((entry) =>
+    entry.beds.some((b) => b.name.trim().toLowerCase() === bed.name.trim().toLowerCase())
+  );
+  const shapeRadius = bed.shape === "circle_oval" ? "50%" : "0.6rem";
+  const sizeLabel =
+    bed.shape === "custom_points"
+      ? `~${bed.approxSqFt} sq ft`
+      : bed.shape === "circle_oval"
+      ? `⌀${bed.widthFt}ft × ${bed.lengthFt}ft`
+      : `${bed.widthFt}ft × ${bed.lengthFt}ft`;
+  const boxWidthPx = Math.max(170, bed.widthFt * FT_TO_PX);
+  const boxHeightPx = Math.max(100, bed.lengthFt * FT_TO_PX);
+  const polyString = isCustom ? bed.customPoints.map((p) => `${p.x * FT_TO_PX},${p.y * FT_TO_PX}`).join(" ") : "";
+
+  return (
+    <div
+      className="absolute"
+      style={{ left: bed.x, top: bed.y, width: boxWidthPx, minHeight: boxHeightPx }}
+      onMouseEnter={() => setHovering(true)}
+      onMouseLeave={() => setHovering(false)}
+    >
+      {/* Label lives entirely outside the shape now — name/size text was getting cramped or cut off
+          when squeezed inside small or oddly-shaped beds. This is also the drag handle. */}
+      <div
+        className="absolute z-10 flex items-center gap-1.5 bg-white border border-stone-300 rounded-full shadow-sm px-2.5 py-1 cursor-grab active:cursor-grabbing"
+        style={{ bottom: "100%", left: 0, marginBottom: 6, whiteSpace: "nowrap" }}
+        onMouseDown={(e) => startDrag("bed", bed.id, e)}
+        onTouchStart={(e) => startDrag("bed", bed.id, e)}
+      >
+        <div>
+          <div className="fraunces text-sm leading-tight">{bed.name}</div>
+          <div className="mono-label text-xs text-stone-500">{sizeLabel}</div>
+        </div>
+        <button
+          onClick={() => setPinned((p) => !p)}
+          onMouseDown={(e) => e.stopPropagation()}
+          onTouchStart={(e) => e.stopPropagation()}
+          className={`shrink-0 p-1.5 rounded-full hover:bg-stone-100 ${pinned ? "bg-stone-200" : ""}`}
+          title={pinned ? "Hide bed details" : "Show bed details"}
+        >
+          <Info size={14} className="text-stone-600" />
+        </button>
+      </div>
+
+      {isCustom && (
+        <svg
+          className="absolute inset-0 pointer-events-none"
+          width={Math.max(boxWidthPx, bed.widthFt * FT_TO_PX)}
+          height={Math.max(boxHeightPx, bed.lengthFt * FT_TO_PX)}
+          style={{ overflow: "visible" }}
+        >
+          <polygon points={polyString} className={`${soil.fill} opacity-90`} stroke="rgba(0,0,0,0.35)" strokeWidth="2" />
+        </svg>
+      )}
+      <div
+        className={`relative shadow-md border-2 ${soil.border} ${!isCustom ? `${soil.swatch} soil-texture` : "bg-transparent"} flex flex-col overflow-hidden`}
+        style={{
+          width: "100%",
+          minHeight: boxHeightPx,
+          borderRadius: isCustom ? "0.4rem" : shapeRadius,
+          borderColor: isCustom ? "transparent" : undefined,
+          boxShadow: isCustom ? "none" : undefined,
+        }}
+      >
+        {/* Interior is dedicated to plants. Circle/oval needs extra padding here — its usable interior
+            (the largest rectangle that fits inside a circle) is meaningfully smaller than its bounding
+            box, so content near the corners would otherwise get clipped by the curved edge. */}
+        <div
+          className="flex flex-wrap gap-1.5 items-start content-start h-full"
+          style={{ padding: bed.shape === "circle_oval" ? "16%" : "0.5rem" }}
+        >
+          {bed.plants.map((p) => {
+            const isRenaming = renaming && renaming.scope === "bed" && renaming.bedId === bed.id && renaming.plantId === p.id;
+            const mismatchReason = lightMismatch(bed.sunExposure, resolveNeedValue(p.light, p.name, "light"));
+            const neighbors = bed.plants.filter((other) => other.id !== p.id);
+            const companion = p.companionWarningsDismissed ? { goodNeighbors: [], badNeighbors: [] } : getCompanionRelations(p, neighbors);
+            const rotationWarning = p.rotationWarningsDismissed ? null : getRotationWarning(bed.name, p.name, yearHistory);
+            return (
+              <span key={p.id} className={`inline-flex items-center gap-1 border rounded-full px-2 py-0.5 text-xs shadow-sm ${soil.chip}`}>
+                {mismatchReason && (
+                  <span title={mismatchReason} className="inline-flex text-amber-600 shrink-0">
+                    <AlertTriangle size={12} />
+                  </span>
+                )}
+                {rotationWarning && (
+                  <span
+                    title={`You grew ${rotationWarning.matchedPlant} (also a ${rotationWarning.family}) in this bed in ${rotationWarning.year} — rotating away from the same family helps avoid depleting the soil and building up pests here.`}
+                    className="inline-flex text-orange-600 shrink-0"
+                  >
+                    <History size={12} />
+                  </span>
+                )}
+                {companion.badNeighbors.length > 0 && (
+                  <span
+                    title={`Traditionally avoided near: ${companion.badNeighbors.join(", ")} (this bed) — folklore, not proven science.`}
+                    className="inline-flex text-red-600 shrink-0"
+                  >
+                    <AlertTriangle size={12} />
+                  </span>
+                )}
+                {companion.goodNeighbors.length > 0 && (
+                  <span
+                    title={`Traditionally grows well near: ${companion.goodNeighbors.join(", ")} (this bed).`}
+                    className="inline-flex text-emerald-600 shrink-0"
+                  >
+                    <Check size={12} />
+                  </span>
+                )}
+                {isRenaming ? (
+                  <input
+                    ref={renameInputRef}
+                    value={renaming.text}
+                    onChange={(e) => setRenaming((r) => ({ ...r, text: e.target.value }))}
+                    onBlur={commitRename}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") commitRename();
+                      if (e.key === "Escape") setRenaming(null);
+                    }}
+                    className="w-20 bg-white/80 border border-stone-300 rounded px-1 text-xs focus:outline-none"
+                  />
+                ) : (
+                  <>
+                    {p.name}
+                    {p.cultivar && <span className="text-stone-500 italic">({p.cultivar})</span>}
+                    <button onClick={() => startRename("bed", bed.id, p.id, p.name)} title="Rename plant" className="hover:text-stone-900 p-1 -m-1">
+                      <Pencil size={10} />
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => setEditingPlant({ scope: "bed", bedId: bed.id, plantId: p.id })}
+                  title="Light, water & temperature needs"
+                  className="hover:text-stone-900 p-1 -m-1"
+                >
+                  <Info size={11} />
+                </button>
+                <button onClick={() => ejectPlantFromBed(bed.id, p.id)} title="Move out to the open map" className="hover:text-stone-900 p-1 -m-1">
+                  <ArrowUpRightFromCircle size={11} />
+                </button>
+                <button onClick={() => deletePlantFromBed(bed.id, p.id)} title="Delete plant" className="hover:text-red-600 p-1 -m-1">
+                  <X size={12} />
+                </button>
+              </span>
+            );
+          })}
+          {bed.plants.length === 0 && (
+            <span className={`text-xs italic ${isCustom ? "text-stone-500" : "text-stone-700/70"}`}>No plants yet</span>
+          )}
+        </div>
+      </div>
+
+      {/* Resize handles — only for shapes with a meaningful width/length to drag (custom shapes have
+          their own point-based reshape flow instead). */}
+      {showDetails && (bed.shape === "rectangle" || bed.shape === "circle_oval") && (
+        <>
+          <div
+            onMouseDown={(e) => startResizeDrag(bed.id, "right", e)}
+            onTouchStart={(e) => startResizeDrag(bed.id, "right", e)}
+            className="absolute bg-emerald-600 border-2 border-white rounded-full shadow"
+            style={{ right: -6, top: "50%", width: 12, height: 28, marginTop: -14, cursor: "ew-resize" }}
+            title="Drag to resize width"
+          />
+          <div
+            onMouseDown={(e) => startResizeDrag(bed.id, "left", e)}
+            onTouchStart={(e) => startResizeDrag(bed.id, "left", e)}
+            className="absolute bg-emerald-600 border-2 border-white rounded-full shadow"
+            style={{ left: -6, top: "50%", width: 12, height: 28, marginTop: -14, cursor: "ew-resize" }}
+            title="Drag to resize width"
+          />
+          <div
+            onMouseDown={(e) => startResizeDrag(bed.id, "bottom", e)}
+            onTouchStart={(e) => startResizeDrag(bed.id, "bottom", e)}
+            className="absolute bg-emerald-600 border-2 border-white rounded-full shadow"
+            style={{ bottom: -6, left: "50%", width: 28, height: 12, marginLeft: -14, cursor: "ns-resize" }}
+            title="Drag to resize length"
+          />
+          <div
+            onMouseDown={(e) => startResizeDrag(bed.id, "top", e)}
+            onTouchStart={(e) => startResizeDrag(bed.id, "top", e)}
+            className="absolute bg-emerald-600 border-2 border-white rounded-full shadow"
+            style={{ top: -6, left: "50%", width: 28, height: 12, marginLeft: -14, cursor: "ns-resize" }}
+            title="Drag to resize length"
+          />
+        </>
+      )}
+
+      {/* Details card: a completely separate floating element below the bed, so the bed's own
+          shape (especially circle/oval, whose border-radius depends on the box's own size) never
+          resizes or distorts when this appears on hover or when pinned. */}
+      {showDetails && (
+        <div
+          className="absolute z-20 bg-white border border-stone-300 rounded-lg shadow-lg p-2 flex flex-col gap-1.5"
+          style={{ top: "100%", left: 0, marginTop: 6, width: Math.max(220, boxWidthPx) }}
+        >
+          <div className="flex items-center justify-end gap-1.5">
+            <button onClick={() => setEditingBed(bed)} className="opacity-70 hover:opacity-100 p-1.5 rounded-full hover:bg-black/10" title="Edit bed details">
+              <Edit3 size={14} />
+            </button>
+            {bed.shape === "custom_points" && (
+              <button onClick={() => startCanvasDrawForBedShape(bed.id)} className="opacity-70 hover:opacity-100 p-1.5 rounded-full hover:bg-black/10" title="Edit shape">
+                <PenTool size={14} />
+              </button>
+            )}
+            <button onClick={() => duplicateBed(bed.id)} className="opacity-70 hover:opacity-100 p-1.5 rounded-full hover:bg-black/10" title="Duplicate bed">
+              <Copy size={14} />
+            </button>
+            {hasHistoryForThisBed && (
+              <button
+                onClick={() => {
+                  if (window.confirm(`Clear all past-year history for "${bed.name}"? This removes its records from every archived year and can't be undone.`)) {
+                    clearBedHistory(bed.name);
+                  }
+                }}
+                className="opacity-70 hover:opacity-100 hover:text-orange-600 p-1.5 rounded-full hover:bg-black/10"
+                title="Clear this bed's rotation history"
+              >
+                <History size={14} />
+              </button>
+            )}
+            <button onClick={() => deleteBed(bed.id)} className="opacity-70 hover:opacity-100 hover:text-red-500 p-1.5 rounded-full hover:bg-black/10" title="Delete bed">
+              <Trash2 size={15} />
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-1">
+            <div className="inline-flex items-center gap-1 text-xs mono-label text-stone-500 bg-stone-100 border border-stone-300 rounded-full px-2 py-0.5">
+              <MapPin size={10} /> {locationLabel}
+            </div>
+            <div className="inline-flex items-center gap-1 text-xs mono-label text-stone-500 bg-stone-100 border border-stone-300 rounded-full px-2 py-0.5">
+              {structureLabel}
+            </div>
+            <div
+              className="inline-flex items-center gap-1 text-xs mono-label text-amber-700 bg-amber-50 border border-amber-300 rounded-full px-2 py-0.5"
+              title={bed.sunExposureSource === "auto" ? "Auto-detected from your light zones — will keep updating unless you set it manually." : undefined}
+            >
+              {sunLabel}
+              {bed.sunExposureSource === "auto" && <span className="text-emerald-600">(auto)</span>}
+              {suggestionDiffers && (
+                <span title={suggestionDiffers} className="inline-flex text-blue-600">
+                  <Info size={11} />
+                </span>
+              )}
+            </div>
+          </div>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              addPlantToBed(bed.id);
+            }}
+            className="flex gap-1"
+          >
+            <input
+              value={bedPlantInputs[bed.id] || ""}
+              onChange={(e) => setBedPlantInputs((prev) => ({ ...prev, [bed.id]: e.target.value }))}
+              placeholder="+ plant name"
+              className="flex-1 min-w-0 border border-stone-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-600"
+            />
+            <button type="submit" className="bg-emerald-700 hover:bg-emerald-800 text-white rounded px-2 text-xs">
+              Add
+            </button>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EditBedModal({ bed, onCancel, onSave, onDrawShape }) {
+  const [values, setValues] = useState(() => bedToFormValues(bed));
+  const hasCustomShape = values.shape === "custom_points" && values.existingCustomPoints && values.existingCustomPoints.length >= 3;
+  return (
+    <div className="fixed inset-0 bg-stone-900/60 flex items-start sm:items-center justify-center z-50 p-2 sm:p-4 overflow-y-auto">
+      <div className="bg-white rounded-xl shadow-xl max-w-md w-full p-4 sm:p-5 my-4 sm:my-8">
+        <h3 className="fraunces text-xl flex items-center gap-2 mb-3">
+          <Edit3 size={18} className="text-emerald-700" /> Edit bed
+        </h3>
+        <BedFields
+          values={values}
+          setValues={setValues}
+          hasCustomShape={hasCustomShape}
+          onDrawShape={() => {
+            onSave(values); // commit any other field edits made so far before leaving the modal to draw
+            onDrawShape();
+          }}
+        />
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onCancel} className="text-sm px-4 py-2 rounded-lg border border-stone-300 hover:bg-stone-50">
+            Cancel
+          </button>
+          <button
+            onClick={() => onSave(values)}
+            className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white"
+          >
+            <Check size={15} /> Save changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function GardenPlanner() {
+  const [beds, setBeds] = useState([]);
+  const [plants, setPlants] = useState([]);
+  const [zone, setZone] = useState("unset");
+  const [zoneCustomText, setZoneCustomText] = useState("");
+  const [zipInput, setZipInput] = useState("");
+  const [zipStatus, setZipStatus] = useState("idle");
+  const [lightZones, setLightZones] = useState([]);
+  const [showLightZones, setShowLightZones] = useState(true);
+  const [backgroundImage, setBackgroundImage] = useState(null);
+  const [showBackgroundImage, setShowBackgroundImage] = useState(true);
+  const [calibrationSession, setCalibrationSession] = useState(null);
+  const imageFileInputRef = useRef(null);
+  const [yearHistory, setYearHistory] = useState([]);
+  const [journalEntries, setJournalEntries] = useState([]);
+  const [showYearRollover, setShowYearRollover] = useState(false);
+  const [zoneForm, setZoneForm] = useState({ sunExposure: "full_sun", customShape: null }); // idle | loading | error
+  const [loaded, setLoaded] = useState(false);
+  const [bedForm, setBedForm] = useState(blankFormValues());
+  const [bedNameError, setBedNameError] = useState(false);
+  const [legendOpen, setLegendOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState("map");
+  const [zoom, setZoom] = useState(1);
+  const [baseWidth, setBaseWidth] = useState(800);
+  const [baseHeight, setBaseHeight] = useState(400);
+  const canvasOuterRef = useRef(null);
+  const importInputRef = useRef(null);
+  const [importError, setImportError] = useState("");
+  const [plantName, setPlantName] = useState("");
+  const [bedPlantInputs, setBedPlantInputs] = useState({});
+  // In-place shape drawing directly on the map. null when not drawing.
+  // { kind: 'bed'|'zone', mode: 'create'|'edit', targetId: null|id, points: [{x,y}] } — points are in the
+  // same absolute/logical canvas coordinates as bed.x/bed.y (already zoom-divided, not yet normalized).
+  const [canvasDraw, setCanvasDraw] = useState(null);
+  const draggingDrawPointRef = useRef(null);
+  const suppressDrawClickRef = useRef(false);
+  const [editingBed, setEditingBed] = useState(null); // bed object or null
+  const [editingPlant, setEditingPlant] = useState(null); // { scope: 'bed'|'free', bedId, plantId } | null
+  const [renaming, setRenaming] = useState(null); // { scope: 'bed'|'free', bedId, plantId, text }
+  const canvasRef = useRef(null);
+  const dragRef = useRef(null);
+  const resizeRef = useRef(null);
+  const renameInputRef = useRef(null);
+
+  const [imageSaveWarning, setImageSaveWarning] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await window.storage.get(STORAGE_KEY);
+        if (result && result.value) {
+          const data = JSON.parse(result.value);
+          setBeds((data.beds || []).map(migrateBed));
+          setPlants((data.plants || []).map(migratePlant));
+          setZone(data.zone || "unset");
+          setZoneCustomText(data.zoneCustomText || "");
+          setLightZones(data.lightZones || []);
+          setYearHistory(data.yearHistory || []);
+          setJournalEntries(data.journalEntries || []);
+          setBackgroundImage(data.backgroundImage || null);
+        }
+      } catch (e) {
+        // no saved data yet
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  const persist = useCallback(
+    async (nextBeds, nextPlants, nextZone, nextZoneCustomText, nextLightZones, nextYearHistory, nextJournalEntries, nextBackgroundImage) => {
+      const basePayload = {
+        beds: nextBeds,
+        plants: nextPlants,
+        zone: nextZone,
+        zoneCustomText: nextZoneCustomText,
+        lightZones: nextLightZones,
+        yearHistory: nextYearHistory,
+        journalEntries: nextJournalEntries,
+      };
+      try {
+        await window.storage.set(STORAGE_KEY, JSON.stringify({ ...basePayload, backgroundImage: nextBackgroundImage }));
+        if (imageSaveWarning) setImageSaveWarning("");
+      } catch (e) {
+        // Most likely the browser's storage quota was exceeded by the image. Don't let that take the rest of
+        // the garden's data down with it — retry without the image so beds/plants/etc. still save correctly.
+        if (nextBackgroundImage) {
+          try {
+            await window.storage.set(STORAGE_KEY, JSON.stringify({ ...basePayload, backgroundImage: null }));
+            setImageSaveWarning("Your uploaded image is too large to save in this browser — everything else saved fine, but the image won't survive a reload. Try a smaller image.");
+          } catch (e2) {
+            console.error("Could not save garden data", e2);
+          }
+        } else {
+          console.error("Could not save garden data", e);
+        }
+      }
+    },
+    [imageSaveWarning]
+  );
+
+  useEffect(() => {
+    if (!loaded) return;
+    persist(beds, plants, zone, zoneCustomText, lightZones, yearHistory, journalEntries, backgroundImage);
+  }, [beds, plants, zone, zoneCustomText, lightZones, yearHistory, journalEntries, backgroundImage, loaded, persist]);
+
+  useEffect(() => {
+    if (bedForm.name.trim()) setBedNameError(false);
+  }, [bedForm.name]);
+
+  useEffect(() => {
+    if (renaming && renameInputRef.current) renameInputRef.current.focus();
+  }, [renaming]);
+
+  useEffect(() => {
+    const el = canvasOuterRef.current;
+    if (!el) return;
+    const measure = () => {
+      setBaseWidth(el.clientWidth || 800);
+      setBaseHeight(el.clientHeight || 400);
+    };
+    measure();
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver(measure);
+      observer.observe(el);
+      return () => observer.disconnect();
+    }
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
+
+  const ZOOM_MIN = 0.03;
+  const ZOOM_MAX = 2;
+  const zoomIn = () => setZoom((z) => Math.min(ZOOM_MAX, Math.round(z * 1.25 * 1000) / 1000));
+  const zoomOut = () => setZoom((z) => Math.max(ZOOM_MIN, Math.round((z / 1.25) * 1000) / 1000));
+  const zoomReset = () => setZoom(1);
+  function zoomToFit() {
+    const xs = [];
+    const ys = [];
+    beds.forEach((b) => {
+      xs.push(b.x, b.x + b.widthFt * FT_TO_PX);
+      ys.push(b.y, b.y + b.lengthFt * FT_TO_PX);
+    });
+    plants.forEach((p) => {
+      xs.push(p.x, p.x + 40);
+      ys.push(p.y, p.y + 30);
+    });
+    lightZones.forEach((z) => {
+      xs.push(z.x, z.x + z.widthFt * FT_TO_PX);
+      ys.push(z.y, z.y + z.lengthFt * FT_TO_PX);
+    });
+    if (backgroundImage) {
+      xs.push(backgroundImage.x, backgroundImage.x + backgroundImage.widthPx);
+      ys.push(backgroundImage.y, backgroundImage.y + backgroundImage.heightPx);
+    }
+    if (xs.length === 0) {
+      setZoom(1);
+      return;
+    }
+    const contentWidth = Math.max(...xs) + 40;
+    const contentHeight = Math.max(...ys) + 40;
+    const containerWidth = (canvasOuterRef.current && canvasOuterRef.current.clientWidth) || baseWidth;
+    const availableHeight = baseHeight;
+    const fitZoom = Math.min(containerWidth / contentWidth, availableHeight / contentHeight, ZOOM_MAX);
+    setZoom(Math.max(ZOOM_MIN, Math.round(fitZoom * 1000) / 1000));
+  }
+
+  function addBed(e) {
+    e.preventDefault();
+    if (!bedForm.name.trim()) {
+      setBedNameError(true);
+      return;
+    }
+    setBedNameError(false);
+    const usedSpots = beds.length;
+    const dims = computeDimensions(bedForm);
+    const x = 24 + (usedSpots % 3) * 40;
+    const y = 24 + Math.floor(usedSpots / 3) * 40;
+    let sunExposure = bedForm.sunExposure;
+    let sunExposureSource = bedForm.sunExposureSource;
+    if (sunExposureSource !== "manual") {
+      const suggestion = suggestSunForBed({ x, y, widthFt: dims.widthFt, lengthFt: dims.lengthFt }, lightZones, FT_TO_PX);
+      if (suggestion) {
+        sunExposure = suggestion;
+        sunExposureSource = "auto";
+      } else {
+        sunExposure = "unknown";
+        sunExposureSource = "unset";
+      }
+    }
+    const newBed = {
+      id: nextId(),
+      name: bedForm.name.trim(),
+      shape: bedForm.shape,
+      ...dims,
+      soilType: bedForm.soilType,
+      yardLocation: bedForm.yardLocation,
+      bedStructure: bedForm.bedStructure,
+      sunExposure,
+      sunExposureSource,
+      x,
+      y,
+      plants: [],
+    };
+    setBeds((b) => [...b, newBed]);
+    setBedForm((f) => ({ ...blankFormValues(), soilType: f.soilType, yardLocation: f.yardLocation, bedStructure: f.bedStructure, sunExposure: f.sunExposure, sunExposureSource: f.sunExposureSource, shape: f.shape }));
+  }
+
+  function saveEditedBed(bedId, values) {
+    const dims = computeDimensions(values);
+    setBeds((prev) =>
+      prev.map((b) =>
+        b.id === bedId
+          ? {
+              ...b,
+              name: values.name.trim() || b.name,
+              shape: values.shape,
+              ...dims,
+              soilType: values.soilType,
+              yardLocation: values.yardLocation,
+              bedStructure: values.bedStructure,
+              sunExposure: values.sunExposure,
+              sunExposureSource: values.sunExposureSource,
+            }
+          : b
+      )
+    );
+    setEditingBed(null);
+  }
+
+  // Whenever zones change, re-check any bed that hasn't been manually set by the user.
+  // A bed the user has explicitly chosen a value for (sunExposureSource: "manual") is never touched.
+  useEffect(() => {
+    if (!loaded) return;
+    setBeds((prev) =>
+      prev.map((bed) => {
+        if (bed.sunExposureSource === "manual") return bed;
+        const suggestion = suggestSunForBed(bed, lightZones, FT_TO_PX);
+        if (suggestion) {
+          return bed.sunExposure === suggestion && bed.sunExposureSource === "auto"
+            ? bed
+            : { ...bed, sunExposure: suggestion, sunExposureSource: "auto" };
+        }
+        return bed.sunExposure === "unknown" && bed.sunExposureSource === "unset"
+          ? bed
+          : { ...bed, sunExposure: "unknown", sunExposureSource: "unset" };
+      })
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lightZones, loaded]);
+
+  function startCanvasDrawForNewBed() {
+    setCanvasDraw({ kind: "bed", mode: "create", targetId: null, points: [] });
+  }
+
+  function startCanvasDrawForBedShape(bedId) {
+    const bed = beds.find((b) => b.id === bedId);
+    if (!bed) return;
+    const existing = (bed.customPoints || []).map((p) => ({ x: bed.x + p.x * FT_TO_PX, y: bed.y + p.y * FT_TO_PX }));
+    setCanvasDraw({ kind: "bed", mode: "edit", targetId: bedId, points: existing });
+  }
+
+  function startCanvasDrawForNewZone() {
+    setCanvasDraw({ kind: "zone", mode: "create", targetId: null, points: [] });
+  }
+
+  function startCanvasDrawForZoneShape(zoneId) {
+    const zone = lightZones.find((z) => z.id === zoneId);
+    if (!zone) return;
+    const existing = (zone.points || []).map((p) => ({ x: zone.x + p.x * FT_TO_PX, y: zone.y + p.y * FT_TO_PX }));
+    setCanvasDraw({ kind: "zone", mode: "edit", targetId: zoneId, points: existing });
+  }
+
+  function cancelCanvasDraw() {
+    setCanvasDraw(null);
+  }
+
+  function undoCanvasDrawPoint() {
+    setCanvasDraw((d) => (d ? { ...d, points: d.points.slice(0, -1) } : d));
+  }
+
+  function finishCanvasDraw() {
+    if (!canvasDraw || canvasDraw.points.length < 3) return;
+    const { widthFt, lengthFt, approxSqFt, points } = normalizePoints(canvasDraw.points.map((p) => ({ x: p.x, y: p.y })), FT_TO_PX);
+    const xs = canvasDraw.points.map((p) => p.x);
+    const ys = canvasDraw.points.map((p) => p.y);
+    const originX = Math.min(...xs);
+    const originY = Math.min(...ys);
+
+    if (canvasDraw.kind === "zone") {
+      if (canvasDraw.mode === "create") {
+        const newZone = { id: nextId(), sunExposure: zoneForm.sunExposure, points, widthFt, lengthFt, approxSqFt, x: originX, y: originY };
+        setLightZones((prev) => [...prev, newZone]);
+      } else {
+        setLightZones((prev) =>
+          prev.map((z) => (z.id === canvasDraw.targetId ? { ...z, points, widthFt, lengthFt, approxSqFt, x: originX, y: originY } : z))
+        );
+      }
+    } else {
+      if (canvasDraw.mode === "create") {
+        if (!bedForm.name.trim()) {
+          setBedNameError(true);
+          return;
+        }
+        let sunExposure = bedForm.sunExposure;
+        let sunExposureSource = bedForm.sunExposureSource;
+        if (sunExposureSource !== "manual") {
+          const suggestion = suggestSunForBed({ x: originX, y: originY, widthFt, lengthFt }, lightZones, FT_TO_PX);
+          sunExposure = suggestion || "unknown";
+          sunExposureSource = suggestion ? "auto" : "unset";
+        }
+        const newBed = {
+          id: nextId(),
+          name: bedForm.name.trim(),
+          shape: "custom_points",
+          widthFt,
+          lengthFt,
+          approxSqFt,
+          customPoints: points,
+          soilType: bedForm.soilType,
+          yardLocation: bedForm.yardLocation,
+          bedStructure: bedForm.bedStructure,
+          sunExposure,
+          sunExposureSource,
+          x: originX,
+          y: originY,
+          plants: [],
+        };
+        setBeds((b) => [...b, newBed]);
+        setBedForm((f) => ({ ...blankFormValues(), soilType: f.soilType, yardLocation: f.yardLocation, bedStructure: f.bedStructure, sunExposure: f.sunExposure, sunExposureSource: f.sunExposureSource, shape: f.shape }));
+      } else {
+        setBeds((prev) =>
+          prev.map((b) =>
+            b.id === canvasDraw.targetId ? { ...b, shape: "custom_points", widthFt, lengthFt, approxSqFt, customPoints: points, x: originX, y: originY } : b
+          )
+        );
+      }
+    }
+    setCanvasDraw(null);
+  }
+
+  function deleteLightZone(id) {
+    setLightZones((prev) => prev.filter((z) => z.id !== id));
+  }
+
+  async function lookupZoneByZip() {
+    const zip = zipInput.trim();
+    if (!/^\d{5}$/.test(zip)) {
+      setZipStatus("error");
+      return;
+    }
+    setZipStatus("loading");
+    try {
+      const res = await fetch(`https://phzmapi.org/${zip}.json`);
+      if (!res.ok) throw new Error("lookup failed");
+      const data = await res.json();
+      if (!data.zone || !USDA_ZONES[data.zone]) throw new Error("no zone in response");
+      setZone(data.zone);
+      setZipStatus("idle");
+      setZipInput("");
+    } catch (err) {
+      setZipStatus("error");
+    }
+  }
+
+  function exportData() {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      app: "Homestead Bed Planner",
+      version: 6,
+      beds,
+      plants,
+      zone,
+      zoneCustomText,
+      lightZones,
+      yearHistory,
+      journalEntries,
+      backgroundImage,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `garden-planner-backup-${dateStr}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function triggerImport() {
+    setImportError("");
+    if (importInputRef.current) importInputRef.current.click();
+  }
+
+  function handleImportFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!data || !Array.isArray(data.beds) || !Array.isArray(data.plants)) {
+          setImportError("That file doesn't look like a garden planner backup.");
+          return;
+        }
+        const proceed = window.confirm(
+          `This will replace everything currently on your map with the backup from ${data.exportedAt ? new Date(data.exportedAt).toLocaleString() : "this file"}. Continue?`
+        );
+        if (!proceed) return;
+        setBeds(data.beds.map(migrateBed));
+        setPlants(data.plants.map(migratePlant));
+        setZone(data.zone || "unset");
+        setZoneCustomText(data.zoneCustomText || "");
+        setLightZones(Array.isArray(data.lightZones) ? data.lightZones : []);
+        setYearHistory(Array.isArray(data.yearHistory) ? data.yearHistory : []);
+        setJournalEntries(Array.isArray(data.journalEntries) ? data.journalEntries : []);
+        setBackgroundImage(data.backgroundImage && data.backgroundImage.dataUrl ? data.backgroundImage : null);
+        setImportError("");
+      } catch (err) {
+        setImportError("Couldn't read that file — it may not be a valid backup.");
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function handleImageFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new window.Image();
+      img.onload = () => {
+        const MAX_DIM = 2200; // large enough to zoom in for precise tracing without going grainy; the quota-exceeded fallback covers the storage-size tradeoff
+        let { naturalWidth: w, naturalHeight: h } = img;
+        let dataUrl = reader.result;
+        if (w > MAX_DIM || h > MAX_DIM) {
+          const scale = Math.min(MAX_DIM / w, MAX_DIM / h);
+          const targetW = Math.round(w * scale);
+          const targetH = Math.round(h * scale);
+          const canvas = document.createElement("canvas");
+          canvas.width = targetW;
+          canvas.height = targetH;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, targetW, targetH);
+          dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+          w = targetW;
+          h = targetH;
+        }
+        setCalibrationSession({ dataUrl, naturalWidth: w, naturalHeight: h, points: [], referenceFt: "" });
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function finishCalibration(referenceFt, points, dataUrl, naturalWidth, naturalHeight) {
+    const [p1, p2] = points;
+    const pixelDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    if (pixelDist <= 0 || !referenceFt || Number(referenceFt) <= 0) return;
+    const ftPerNativePx = Number(referenceFt) / pixelDist;
+    const widthPx = naturalWidth * ftPerNativePx * FT_TO_PX;
+    const heightPx = naturalHeight * ftPerNativePx * FT_TO_PX;
+    // Recalibrating an existing image keeps its current position/opacity — only a brand-new upload starts fresh.
+    const isRecalibration = backgroundImage && backgroundImage.dataUrl === dataUrl;
+    setBackgroundImage({
+      dataUrl,
+      x: isRecalibration ? backgroundImage.x : 24,
+      y: isRecalibration ? backgroundImage.y : 24,
+      widthPx,
+      heightPx,
+      opacity: isRecalibration ? backgroundImage.opacity : 0.85,
+      locked: false,
+    });
+    setCalibrationSession(null);
+  }
+
+  function addJournalEntry(entry) {
+    setJournalEntries((prev) => [...prev, { id: nextId(), createdAt: new Date().toISOString(), ...entry }]);
+  }
+
+  function deleteJournalEntry(id) {
+    setJournalEntries((prev) => prev.filter((e) => e.id !== id));
+  }
+
+  function archiveYearAndReset(yearLabel, keptPlantIds) {
+    const snapshot = {
+      id: nextId(),
+      year: yearLabel.trim() || String(new Date().getFullYear()),
+      archivedAt: new Date().toISOString(),
+      zone,
+      zoneCustomText,
+      yearNotes: "",
+      beds: JSON.parse(JSON.stringify(beds)),
+      plants: JSON.parse(JSON.stringify(plants)),
+    };
+    setYearHistory((prev) => [...prev, snapshot]);
+    setBeds((prev) => prev.map((bed) => ({ ...bed, plants: bed.plants.filter((p) => keptPlantIds.has(p.id)) })));
+    setPlants((prev) => prev.filter((p) => keptPlantIds.has(p.id)));
+    setShowYearRollover(false);
+  }
+
+  function deleteYearHistoryEntry(id) {
+    setYearHistory((prev) => prev.filter((h) => h.id !== id));
+  }
+
+  // Removes just this one bed's records from every archived year, leaving other beds in those
+  // years untouched — for correcting a bad bed name/entry without losing the rest of that year's data.
+  function clearBedHistory(bedName) {
+    setYearHistory((prev) =>
+      prev.map((entry) => ({
+        ...entry,
+        beds: entry.beds.filter((b) => b.name.trim().toLowerCase() !== bedName.trim().toLowerCase()),
+      }))
+    );
+  }
+
+  function updateYearNotes(entryId, text) {
+    setYearHistory((prev) => prev.map((entry) => (entry.id === entryId ? { ...entry, yearNotes: text } : entry)));
+  }
+
+  // bedId is null for a freestanding plant in that year's snapshot.
+  function updateHistoryPlantNote(entryId, bedId, plantId, text) {
+    setYearHistory((prev) =>
+      prev.map((entry) => {
+        if (entry.id !== entryId) return entry;
+        if (bedId) {
+          return {
+            ...entry,
+            beds: entry.beds.map((b) =>
+              b.id === bedId ? { ...b, plants: b.plants.map((p) => (p.id === plantId ? { ...p, historyNote: text } : p)) } : b
+            ),
+          };
+        }
+        return { ...entry, plants: entry.plants.map((p) => (p.id === plantId ? { ...p, historyNote: text } : p)) };
+      })
+    );
+  }
+
+  function duplicateBed(bedId) {
+    setBeds((prev) => {
+      const bed = prev.find((b) => b.id === bedId);
+      if (!bed) return prev;
+      const copy = {
+        ...bed,
+        id: nextId(),
+        name: `${bed.name} (copy)`,
+        x: bed.x + 26,
+        y: bed.y + 26,
+        plants: bed.plants.map((p) => ({ ...p, id: nextId() })),
+      };
+      return [...prev, copy];
+    });
+  }
+
+  function addFreestandingPlant(e) {
+    e.preventDefault();
+    if (!plantName.trim()) return;
+    const n = plants.length;
+    setPlants((p) => [
+      ...p,
+      {
+        id: nextId(),
+        name: plantName.trim(),
+        x: 40 + (n % 5) * 20,
+        y: 400 + Math.floor(n / 5) * 20,
+        light: "unknown",
+        water: "unknown",
+        temp: "unknown",
+        cultivar: "",
+        plantingStartIndoors: "",
+        plantingOutside: "",
+        harvestWindow: "",
+        companionNotes: "",
+        companionWarningsDismissed: false,
+        rotationWarningsDismissed: false,
+      },
+    ]);
+    setPlantName("");
+  }
+
+  function addPlantToBed(bedId) {
+    const name = (bedPlantInputs[bedId] || "").trim();
+    if (!name) return;
+    setBeds((prev) =>
+      prev.map((bed) =>
+        bed.id === bedId
+          ? { ...bed, plants: [...bed.plants, { id: nextId(), name, light: "unknown", water: "unknown", temp: "unknown", cultivar: "", plantingStartIndoors: "", plantingOutside: "", harvestWindow: "", companionNotes: "", companionWarningsDismissed: false, rotationWarningsDismissed: false }] }
+          : bed
+      )
+    );
+    setBedPlantInputs((prev) => ({ ...prev, [bedId]: "" }));
+  }
+
+  function savePlantDetails(target, details) {
+    if (target.scope === "bed") {
+      setBeds((prev) =>
+        prev.map((bed) =>
+          bed.id === target.bedId
+            ? { ...bed, plants: bed.plants.map((p) => (p.id === target.plantId ? { ...p, ...details } : p)) }
+            : bed
+        )
+      );
+    } else {
+      setPlants((prev) => prev.map((p) => (p.id === target.plantId ? { ...p, ...details } : p)));
+    }
+    setEditingPlant(null);
+  }
+
+  function ejectPlantFromBed(bedId, plantId) {
+    setBeds((prev) => {
+      let ejected = null;
+      const nextBeds = prev.map((bed) => {
+        if (bed.id !== bedId) return bed;
+        const found = bed.plants.find((p) => p.id === plantId);
+        if (found) ejected = found;
+        return { ...bed, plants: bed.plants.filter((p) => p.id !== plantId) };
+      });
+      if (ejected) {
+        const bed = prev.find((b) => b.id === bedId);
+        setPlants((pl) => [...pl, { id: ejected.id, name: ejected.name, x: (bed?.x || 0) + 10, y: (bed?.y || 0) + 10 }]);
+      }
+      return nextBeds;
+    });
+  }
+
+  function deletePlantFromBed(bedId, plantId) {
+    setBeds((prev) => prev.map((bed) => (bed.id === bedId ? { ...bed, plants: bed.plants.filter((p) => p.id !== plantId) } : bed)));
+  }
+
+  function deleteFreestandingPlant(plantId) {
+    setPlants((prev) => prev.filter((p) => p.id !== plantId));
+  }
+
+  function movePlantToBed(plantId, bedId) {
+    if (!bedId) return;
+    setPlants((prev) => {
+      const found = prev.find((p) => p.id === plantId);
+      if (found) {
+        setBeds((beds) =>
+          beds.map((bed) => (bed.id === bedId ? { ...bed, plants: [...bed.plants, { id: found.id, name: found.name }] } : bed))
+        );
+      }
+      return prev.filter((p) => p.id !== plantId);
+    });
+  }
+
+  function deleteBed(bedId) {
+    setBeds((prev) => {
+      const bed = prev.find((b) => b.id === bedId);
+      if (bed && bed.plants.length) {
+        setPlants((pl) => [
+          ...pl,
+          ...bed.plants.map((p, i) => ({ id: p.id, name: p.name, x: bed.x + 10 + i * 4, y: bed.y + 10 + i * 4 })),
+        ]);
+      }
+      return prev.filter((b) => b.id !== bedId);
+    });
+  }
+
+  function startRename(scope, bedId, plantId, currentName) {
+    setRenaming({ scope, bedId, plantId, text: currentName });
+  }
+
+  function commitRename() {
+    if (!renaming) return;
+    const name = renaming.text.trim();
+    if (name) {
+      if (renaming.scope === "bed") {
+        setBeds((prev) =>
+          prev.map((bed) =>
+            bed.id === renaming.bedId
+              ? { ...bed, plants: bed.plants.map((p) => (p.id === renaming.plantId ? { ...p, name } : p)) }
+              : bed
+          )
+        );
+      } else {
+        setPlants((prev) => prev.map((p) => (p.id === renaming.plantId ? { ...p, name } : p)));
+      }
+    }
+    setRenaming(null);
+  }
+
+  const startDrag = (kind, id, e) => {
+    e.preventDefault();
+    const canvasRect = canvasRef.current.getBoundingClientRect();
+    const list = kind === "bed" ? beds : kind === "zone" ? lightZones : kind === "image" ? [backgroundImage] : plants;
+    const item = kind === "image" ? backgroundImage : list.find((i) => i.id === id);
+    if (!item) return;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    dragRef.current = {
+      kind,
+      id,
+      offsetX: (clientX - canvasRect.left) / zoom - item.x,
+      offsetY: (clientY - canvasRect.top) / zoom - item.y,
+    };
+    window.addEventListener("mousemove", onDragMove);
+    window.addEventListener("mouseup", onDragEnd);
+    window.addEventListener("touchmove", onDragMove, { passive: false });
+    window.addEventListener("touchend", onDragEnd);
+  };
+
+  const onDragMove = (e) => {
+    if (!dragRef.current || !canvasRef.current) return;
+    e.preventDefault();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    const canvasRect = canvasRef.current.getBoundingClientRect();
+    const { kind, id, offsetX, offsetY } = dragRef.current;
+    let x = (clientX - canvasRect.left) / zoom - offsetX;
+    let y = (clientY - canvasRect.top) / zoom - offsetY;
+    x = Math.max(0, x);
+    y = Math.max(0, y);
+    if (kind === "bed") setBeds((prev) => prev.map((b) => (b.id === id ? { ...b, x, y } : b)));
+    else if (kind === "zone") setLightZones((prev) => prev.map((z) => (z.id === id ? { ...z, x, y } : z)));
+    else if (kind === "image") setBackgroundImage((prev) => (prev ? { ...prev, x, y } : prev));
+    else setPlants((prev) => prev.map((p) => (p.id === id ? { ...p, x, y } : p)));
+  };
+
+  const onDragEnd = () => {
+    const finished = dragRef.current;
+    dragRef.current = null;
+    window.removeEventListener("mousemove", onDragMove);
+    window.removeEventListener("mouseup", onDragEnd);
+    window.removeEventListener("touchmove", onDragMove);
+    window.removeEventListener("touchend", onDragEnd);
+
+    // If a bed the user hasn't manually set was just moved, re-check where it landed relative to the light zones.
+    if (finished && finished.kind === "bed") {
+      setBeds((prev) =>
+        prev.map((bed) => {
+          if (bed.id !== finished.id || bed.sunExposureSource === "manual") return bed;
+          const suggestion = suggestSunForBed(bed, lightZones, FT_TO_PX);
+          if (suggestion) return { ...bed, sunExposure: suggestion, sunExposureSource: "auto" };
+          return { ...bed, sunExposure: "unknown", sunExposureSource: "unset" };
+        })
+      );
+    }
+  };
+
+  // Resizing a bed by dragging one of its edge handles. Dragging the right/bottom edge changes
+  // that dimension directly; dragging the left/top edge changes the dimension AND shifts the bed's
+  // position so the opposite edge stays put — standard resize-handle behavior.
+  const startResizeDrag = (bedId, edge, e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const bed = beds.find((b) => b.id === bedId);
+    if (!bed) return;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    resizeRef.current = {
+      bedId,
+      edge,
+      startClientX: clientX,
+      startClientY: clientY,
+      startWidthFt: bed.widthFt,
+      startLengthFt: bed.lengthFt,
+      startX: bed.x,
+      startY: bed.y,
+    };
+    window.addEventListener("mousemove", onResizeMove);
+    window.addEventListener("mouseup", onResizeEnd);
+    window.addEventListener("touchmove", onResizeMove, { passive: false });
+    window.addEventListener("touchend", onResizeEnd);
+  };
+
+  const onResizeMove = (e) => {
+    if (!resizeRef.current) return;
+    e.preventDefault();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    const { bedId, edge, startClientX, startClientY, startWidthFt, startLengthFt, startX, startY } = resizeRef.current;
+    const deltaXFt = (clientX - startClientX) / zoom / FT_TO_PX;
+    const deltaYFt = (clientY - startClientY) / zoom / FT_TO_PX;
+    const MIN_FT = 1;
+
+    setBeds((prev) =>
+      prev.map((bed) => {
+        if (bed.id !== bedId) return bed;
+        let widthFt = startWidthFt;
+        let lengthFt = startLengthFt;
+        let x = startX;
+        let y = startY;
+        if (edge === "right") {
+          widthFt = Math.max(MIN_FT, startWidthFt + deltaXFt);
+        } else if (edge === "left") {
+          widthFt = Math.max(MIN_FT, startWidthFt - deltaXFt);
+          x = startX + (startWidthFt - widthFt) * FT_TO_PX;
+        } else if (edge === "bottom") {
+          lengthFt = Math.max(MIN_FT, startLengthFt + deltaYFt);
+        } else if (edge === "top") {
+          lengthFt = Math.max(MIN_FT, startLengthFt - deltaYFt);
+          y = startY + (startLengthFt - lengthFt) * FT_TO_PX;
+        }
+        return { ...bed, widthFt, lengthFt, x: Math.max(0, x), y: Math.max(0, y), approxSqFt: Math.round(widthFt * lengthFt) };
+      })
+    );
+  };
+
+  const onResizeEnd = () => {
+    resizeRef.current = null;
+    window.removeEventListener("mousemove", onResizeMove);
+    window.removeEventListener("mouseup", onResizeEnd);
+    window.removeEventListener("touchmove", onResizeMove);
+    window.removeEventListener("touchend", onResizeEnd);
+  };
+
+  // The canvas must always be at least large enough that, once scaled by the current zoom,
+  // it fills the entire (now fixed-size) "Your land" viewport — otherwise zooming out just
+  // shrinks a same-sized canvas into the corner of that fixed box, leaving blank space around
+  // it and making the visible grid block's proportions look wrong ("misshapen squares").
+  const viewportFillWidth = baseWidth / zoom;
+  const viewportFillHeight = baseHeight / zoom;
+
+  const canvasHeight = Math.max(
+    640,
+    viewportFillHeight,
+    ...beds.map((b) => b.y + b.lengthFt * FT_TO_PX + 60),
+    ...plants.map((p) => p.y + 60),
+    ...lightZones.map((z) => z.y + z.lengthFt * FT_TO_PX + 60),
+    backgroundImage ? backgroundImage.y + backgroundImage.heightPx + 60 : 0,
+    0
+  );
+  // The canvas needs to be as wide as whatever's actually placed on it, not just the viewport —
+  // otherwise the reference grid (and the scrollable area) stop short of beds placed far out,
+  // which is exactly the "squares don't cover the full land" problem on large properties.
+  const contentWidth = Math.max(
+    baseWidth,
+    viewportFillWidth,
+    ...beds.map((b) => b.x + b.widthFt * FT_TO_PX + 60),
+    ...plants.map((p) => p.x + 100),
+    ...lightZones.map((z) => z.x + z.widthFt * FT_TO_PX + 60),
+    backgroundImage ? backgroundImage.x + backgroundImage.widthPx + 60 : 0,
+    0
+  );
+
+  // Converts a mouse/touch event's screen position into the canvas's own logical coordinate space
+  // (the same space bed.x / zone.x etc. live in), accounting for the current zoom level.
+  function eventToCanvasPoint(e) {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    return { x: (clientX - rect.left) / zoom, y: (clientY - rect.top) / zoom };
+  }
+
+  function handleDrawOverlayClick(e) {
+    if (suppressDrawClickRef.current) {
+      suppressDrawClickRef.current = false;
+      return;
+    }
+    if (!canvasDraw) return;
+    const point = eventToCanvasPoint(e);
+    setCanvasDraw((d) => (d ? { ...d, points: [...d.points, point] } : d));
+  }
+
+  function startDrawPointDrag(index, e) {
+    e.stopPropagation();
+    e.preventDefault();
+    draggingDrawPointRef.current = index;
+    window.addEventListener("mousemove", onDrawPointMove);
+    window.addEventListener("mouseup", onDrawPointUp);
+    window.addEventListener("touchmove", onDrawPointMove, { passive: false });
+    window.addEventListener("touchend", onDrawPointUp);
+  }
+
+  function onDrawPointMove(e) {
+    if (draggingDrawPointRef.current === null) return;
+    e.preventDefault();
+    const point = eventToCanvasPoint(e);
+    const idx = draggingDrawPointRef.current;
+    setCanvasDraw((d) => (d ? { ...d, points: d.points.map((p, i) => (i === idx ? point : p)) } : d));
+  }
+
+  function onDrawPointUp() {
+    draggingDrawPointRef.current = null;
+    suppressDrawClickRef.current = true;
+    window.removeEventListener("mousemove", onDrawPointMove);
+    window.removeEventListener("mouseup", onDrawPointUp);
+    window.removeEventListener("touchmove", onDrawPointMove);
+    window.removeEventListener("touchend", onDrawPointUp);
+  }
+
+  return (
+    <div className="min-h-screen bg-stone-100 text-stone-900" style={{ fontFamily: "'Work Sans', sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Work+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap');
+        .fraunces { font-family: 'Fraunces', serif; }
+        .mono-label { font-family: 'IBM Plex Mono', monospace; }
+        .soil-texture { background-image: repeating-linear-gradient(135deg, rgba(255,255,255,0.06) 0px, rgba(255,255,255,0.06) 2px, transparent 2px, transparent 8px); }
+        .land-grid {
+          background-image: linear-gradient(rgba(120,113,90,0.15) 1px, transparent 1px), linear-gradient(90deg, rgba(120,113,90,0.15) 1px, transparent 1px);
+        }
+      `}</style>
+
+      {editingBed && (
+        <EditBedModal
+          bed={editingBed}
+          onCancel={() => setEditingBed(null)}
+          onSave={(values) => saveEditedBed(editingBed.id, values)}
+          onDrawShape={() => startCanvasDrawForBedShape(editingBed.id)}
+        />
+      )}
+
+      {showYearRollover && (
+        <YearRolloverModal
+          beds={beds}
+          plants={plants}
+          onCancel={() => setShowYearRollover(false)}
+          onConfirm={archiveYearAndReset}
+        />
+      )}
+
+      {calibrationSession && (
+        <CalibrationModal
+          session={calibrationSession}
+          onCancel={() => setCalibrationSession(null)}
+          onConfirm={finishCalibration}
+        />
+      )}
+
+      {editingPlant && (() => {
+        const found =
+          editingPlant.scope === "bed"
+            ? beds.find((b) => b.id === editingPlant.bedId)?.plants.find((p) => p.id === editingPlant.plantId)
+            : plants.find((p) => p.id === editingPlant.plantId);
+        if (!found) return null;
+        const neighborPlants =
+          editingPlant.scope === "bed"
+            ? (beds.find((b) => b.id === editingPlant.bedId)?.plants || []).filter((p) => p.id !== editingPlant.plantId)
+            : [];
+        const bedName = editingPlant.scope === "bed" ? beds.find((b) => b.id === editingPlant.bedId)?.name : null;
+        return (
+          <PlantDetailsModal
+            plantName={found.name}
+            initialValues={found}
+            zone={zone}
+            neighborPlants={neighborPlants}
+            bedName={bedName}
+            yearHistory={yearHistory}
+            onCancel={() => setEditingPlant(null)}
+            onSave={(details) => savePlantDetails(editingPlant, details)}
+          />
+        );
+      })()}
+
+      <header className="border-b border-stone-300 bg-stone-50 px-6 py-5">
+        <div className="max-w-7xl mx-auto flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <h1 className="fraunces text-2xl md:text-3xl text-stone-900">Homestead Bed Planner</h1>
+            <p className="text-stone-500 text-sm mt-1">Beds, plants, and the freedom to edit, move, or delete anything, anytime.</p>
+          </div>
+        </div>
+
+        <div className="max-w-7xl mx-auto mt-3 flex items-center flex-wrap gap-x-4 gap-y-2">
+          <div className="flex items-center gap-1.5">
+            <label className="text-xs mono-label text-stone-500">Your zone:</label>
+            <select
+              value={zone}
+              onChange={(e) => setZone(e.target.value)}
+              className="text-sm border border-stone-300 rounded-lg px-2 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              {Object.entries(USDA_ZONES).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+          </div>
+
+          {zone === "international" && (
+            <input
+              value={zoneCustomText}
+              onChange={(e) => setZoneCustomText(e.target.value)}
+              placeholder="Describe your climate/region"
+              className="text-sm border border-stone-300 rounded-lg px-2 py-1.5 w-48 focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            />
+          )}
+
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-stone-400">Don't know it?</span>
+            <input
+              value={zipInput}
+              onChange={(e) => {
+                setZipInput(e.target.value);
+                if (zipStatus === "error") setZipStatus("idle");
+              }}
+              onKeyDown={(e) => e.key === "Enter" && lookupZoneByZip()}
+              placeholder="ZIP code"
+              inputMode="numeric"
+              className={`text-sm border rounded-lg px-2 py-1.5 w-24 focus:outline-none focus:ring-2 ${
+                zipStatus === "error" ? "border-red-400 focus:ring-red-400" : "border-stone-300 focus:ring-emerald-600"
+              }`}
+            />
+            <button
+              type="button"
+              onClick={lookupZoneByZip}
+              disabled={zipStatus === "loading"}
+              className="text-sm border border-stone-300 rounded-lg px-2.5 py-1.5 bg-white hover:bg-stone-50 disabled:opacity-50"
+            >
+              {zipStatus === "loading" ? "Looking up…" : "Find my zone"}
+            </button>
+          </div>
+
+          <a
+            href="https://planthardiness.ars.usda.gov/"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-emerald-700 hover:text-emerald-800 underline"
+          >
+            Or look it up on the official USDA map ↗
+          </a>
+        </div>
+        {zipStatus === "error" && (
+          <p className="max-w-7xl mx-auto text-xs text-red-600 mt-1">
+            Couldn't find a zone for that ZIP (US ZIP codes only, and the free lookup service is sometimes unavailable) — try the official USDA map link instead.
+          </p>
+        )}
+      </header>
+
+      <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-6 pt-4 flex gap-1 border-b border-stone-300">
+        <button
+          type="button"
+          onClick={() => setActiveTab("map")}
+          className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-t-lg border border-b-0 -mb-px ${
+            activeTab === "map" ? "bg-white border-stone-300 text-emerald-700" : "bg-transparent border-transparent text-stone-500 hover:text-stone-700"
+          }`}
+        >
+          <Map size={15} /> Garden map
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab("calendar")}
+          className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-t-lg border border-b-0 -mb-px ${
+            activeTab === "calendar" ? "bg-white border-stone-300 text-emerald-700" : "bg-transparent border-transparent text-stone-500 hover:text-stone-700"
+          }`}
+        >
+          <CalendarDays size={15} /> Calendar
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab("history")}
+          className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-t-lg border border-b-0 -mb-px ${
+            activeTab === "history" ? "bg-white border-stone-300 text-emerald-700" : "bg-transparent border-transparent text-stone-500 hover:text-stone-700"
+          }`}
+        >
+          <History size={15} /> History
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab("journal")}
+          className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-t-lg border border-b-0 -mb-px ${
+            activeTab === "journal" ? "bg-white border-stone-300 text-emerald-700" : "bg-transparent border-transparent text-stone-500 hover:text-stone-700"
+          }`}
+        >
+          <BookOpen size={15} /> Journal
+        </button>
+      </div>
+
+      {activeTab === "calendar" ? (
+        <CalendarView beds={beds} plants={plants} />
+      ) : activeTab === "history" ? (
+        <HistoryView
+          yearHistory={yearHistory}
+          onDeleteEntry={deleteYearHistoryEntry}
+          onUpdateYearNotes={updateYearNotes}
+          onUpdatePlantNote={updateHistoryPlantNote}
+        />
+      ) : activeTab === "journal" ? (
+        <JournalView journalEntries={journalEntries} beds={beds} onAddEntry={addJournalEntry} onDeleteEntry={deleteJournalEntry} />
+      ) : (
+      <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6 flex flex-col sm:flex-row gap-4 sm:gap-6">
+        {/* Sidebar */}
+        <div className="space-y-4 sm:space-y-6 w-full sm:w-64 md:w-72 lg:w-80 sm:flex-shrink-0">
+          <section className="bg-white border border-stone-300 rounded-xl p-4">
+            <h2 className="fraunces text-lg mb-3 flex items-center gap-2">
+              <Plus size={18} className="text-emerald-700" /> Add a bed
+            </h2>
+            <form onSubmit={addBed}>
+              <BedFields
+                values={bedForm}
+                setValues={setBedForm}
+                onDrawShape={startCanvasDrawForNewBed}
+                hasCustomShape={false}
+                nameError={bedNameError}
+              />
+              <button
+                type="submit"
+                disabled={bedForm.shape === "custom_points"}
+                className="w-full mt-3 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg py-2 text-sm font-medium transition-colors disabled:opacity-40"
+              >
+                {bedForm.shape === "custom_points" ? "Use \"Draw shape on the map\" above" : "Add bed to the map"}
+              </button>
+            </form>
+          </section>
+
+          <section className="bg-white border border-stone-300 rounded-xl p-4">
+            <h2 className="fraunces text-lg mb-2 flex items-center gap-2">
+              <Sun size={18} className="text-emerald-700" /> Light zones
+            </h2>
+            <p className="text-xs text-stone-500 mb-3">
+              Draw where the sun actually falls in your yard. Beds placed inside a zone get their sun exposure
+              suggested automatically — you can still change it yourself anytime.
+            </p>
+            <div className="space-y-3">
+              <div>
+                <label className="text-xs mono-label text-stone-500 block mb-1">This zone gets</label>
+                <select
+                  value={zoneForm.sunExposure}
+                  onChange={(e) => setZoneForm((f) => ({ ...f, sunExposure: e.target.value }))}
+                  className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                >
+                  <option value="full_sun">{SUN_EXPOSURES.full_sun}</option>
+                  <option value="part_sun">{SUN_EXPOSURES.part_sun}</option>
+                  <option value="full_shade">{SUN_EXPOSURES.full_shade}</option>
+                </select>
+              </div>
+              <button
+                type="button"
+                onClick={startCanvasDrawForNewZone}
+                className="w-full flex items-center justify-center gap-2 border border-emerald-700 text-emerald-700 rounded-lg py-2 text-sm font-medium hover:bg-emerald-50"
+              >
+                <PenTool size={15} />
+                Draw this zone on the map
+              </button>
+              <p className="text-xs text-stone-400">
+                Click directly on "Your land" below to place corner points, then click Finish to add it.
+              </p>
+            </div>
+            {lightZones.length > 0 && (
+              <div className="mt-3 space-y-1.5">
+                {lightZones.map((z) => (
+                  <div key={z.id} className={`flex items-center justify-between text-xs rounded-lg border px-2 py-1.5 ${LIGHT_ZONE_STYLES[z.sunExposure].badge}`}>
+                    <span>{SUN_EXPOSURES[z.sunExposure]} · ~{z.approxSqFt} sq ft</span>
+                    <div className="flex items-center gap-1">
+                      <button onClick={() => startCanvasDrawForZoneShape(z.id)} className="hover:text-emerald-700 p-1 -m-1" title="Reshape this zone">
+                        <PenTool size={12} />
+                      </button>
+                      <button onClick={() => deleteLightZone(z.id)} className="hover:text-red-600 p-1 -m-1" title="Delete zone">
+                        <X size={12} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section className="bg-white border border-stone-300 rounded-xl p-4">
+            <h2 className="fraunces text-lg mb-2 flex items-center gap-2">
+              <ImageIcon size={18} className="text-emerald-700" /> Satellite / aerial image
+            </h2>
+            <p className="text-xs text-stone-500 mb-3">
+              Upload a screenshot of your property from Google Maps or similar, calibrate it to a known real-world
+              distance, then use "Custom — draw it yourself" for beds to trace directly over it.
+            </p>
+            <input ref={imageFileInputRef} type="file" accept="image/*" onChange={handleImageFile} className="hidden" />
+            {imageSaveWarning && (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-2 mb-2">
+                {imageSaveWarning}
+              </p>
+            )}
+            {!backgroundImage ? (
+              <button
+                type="button"
+                onClick={() => imageFileInputRef.current && imageFileInputRef.current.click()}
+                className="w-full flex items-center justify-center gap-2 border border-emerald-700 text-emerald-700 rounded-lg py-2 text-sm font-medium hover:bg-emerald-50"
+              >
+                <Upload size={15} />
+                Upload an image
+              </button>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowBackgroundImage((s) => !s)}
+                    className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border border-stone-300 hover:bg-stone-50"
+                  >
+                    {showBackgroundImage ? <Eye size={13} /> : <EyeOff size={13} />}
+                    {showBackgroundImage ? "Visible" : "Hidden"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setBackgroundImage((prev) => (prev ? { ...prev, locked: !prev.locked } : prev))}
+                    className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border ${
+                      backgroundImage.locked ? "border-emerald-600 bg-emerald-50 text-emerald-800" : "border-stone-300 hover:bg-stone-50"
+                    }`}
+                    title={backgroundImage.locked ? "Unlock to reposition the image" : "Lock the image in place to avoid nudging it by accident"}
+                  >
+                    {backgroundImage.locked ? <Lock size={13} /> : <Unlock size={13} />}
+                    {backgroundImage.locked ? "Locked" : "Unlocked"}
+                  </button>
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const img = new window.Image();
+                      img.onload = () =>
+                        setCalibrationSession({
+                          dataUrl: backgroundImage.dataUrl,
+                          naturalWidth: img.naturalWidth,
+                          naturalHeight: img.naturalHeight,
+                          points: [],
+                          referenceFt: "",
+                        });
+                      img.src = backgroundImage.dataUrl;
+                    }}
+                    className="text-xs text-stone-500 hover:text-emerald-700 underline"
+                  >
+                    Recalibrate
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (window.confirm("Remove the uploaded image from your map?")) setBackgroundImage(null);
+                    }}
+                    className="text-xs text-stone-500 hover:text-red-600 underline"
+                  >
+                    Remove
+                  </button>
+                </div>
+                <div>
+                  <label className="text-xs mono-label text-stone-500 block mb-1">Opacity</label>
+                  <input
+                    type="range"
+                    min="0.1"
+                    max="1"
+                    step="0.05"
+                    value={backgroundImage.opacity}
+                    onChange={(e) => setBackgroundImage((prev) => ({ ...prev, opacity: Number(e.target.value) }))}
+                    className="w-full"
+                  />
+                </div>
+                <p className="text-xs text-stone-400">
+                  {backgroundImage.locked
+                    ? "Locked — the image won't move if you click near it while tracing beds. Unlock to reposition."
+                    : "Drag the image directly on the map to reposition it, then lock it in place when it's right."}
+                </p>
+              </div>
+            )}
+          </section>
+
+          <section className="bg-white border border-stone-300 rounded-xl p-4">
+            <h2 className="fraunces text-lg mb-3 flex items-center gap-2">
+              <Sprout size={18} className="text-emerald-700" /> Add a freestanding plant
+            </h2>
+            <p className="text-xs text-stone-500 mb-3">No bed needed — it'll sit on the open map and you can drag it into a bed later.</p>
+            <form onSubmit={addFreestandingPlant} className="flex gap-2">
+              <input
+                value={plantName}
+                onChange={(e) => setPlantName(e.target.value)}
+                placeholder="e.g. Elderberry"
+                className="flex-1 border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+              />
+              <button type="submit" className="bg-stone-800 hover:bg-stone-900 text-white rounded-lg px-3 text-sm font-medium transition-colors">
+                Add
+              </button>
+            </form>
+          </section>
+
+          <section className="bg-white border border-stone-300 rounded-xl p-4">
+            <h2 className="fraunces text-lg mb-2 flex items-center gap-2">
+              <CalendarDays size={18} className="text-emerald-700" /> New year
+            </h2>
+            <p className="text-xs text-stone-500 mb-3">
+              Archive everything currently in your garden and start fresh for the next season — with the option to
+              carry specific plants forward.
+            </p>
+            <button
+              type="button"
+              onClick={() => setShowYearRollover(true)}
+              className="w-full border border-emerald-700 text-emerald-700 rounded-lg py-2 text-sm font-medium hover:bg-emerald-50"
+            >
+              Start a new year
+            </button>
+          </section>
+
+          <section className="bg-white border border-stone-300 rounded-xl p-4">
+            <h2 className="fraunces text-lg mb-2 flex items-center gap-2">
+              <Download size={18} className="text-emerald-700" /> Backup & restore
+            </h2>
+            <p className="text-xs text-stone-500 mb-3">
+              Your garden only lives in this browser. Save a backup file now and then, so you're never one cleared cache away from losing it.
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={exportData}
+                className="flex-1 flex items-center justify-center gap-1.5 border border-emerald-700 text-emerald-700 rounded-lg py-2 text-sm font-medium hover:bg-emerald-50"
+              >
+                <Download size={15} /> Export
+              </button>
+              <button
+                type="button"
+                onClick={triggerImport}
+                className="flex-1 flex items-center justify-center gap-1.5 border border-stone-300 text-stone-700 rounded-lg py-2 text-sm font-medium hover:bg-stone-50"
+              >
+                <Upload size={15} /> Import
+              </button>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept="application/json"
+                onChange={handleImportFile}
+                className="hidden"
+              />
+            </div>
+            {importError && <p className="text-xs text-red-600 mt-2">{importError}</p>}
+          </section>
+
+          <section className="bg-white border border-stone-300 rounded-xl p-4">
+            <button
+              type="button"
+              onClick={() => setLegendOpen((o) => !o)}
+              className="w-full flex items-center justify-between fraunces text-base"
+            >
+              Legend
+              {legendOpen ? <ChevronDown size={16} className="text-stone-500" /> : <ChevronRight size={16} className="text-stone-500" />}
+            </button>
+            {legendOpen && (
+              <div className="mt-2">
+                <div className="mb-3">
+                  <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">Soil type (bed color)</div>
+                  <div className="space-y-1.5">
+                    {Object.entries(SOIL_TYPES).map(([key, s]) => (
+                      <div key={key} className="flex items-center gap-2 text-sm">
+                        <span className={`inline-block w-4 h-4 rounded ${s.swatch} border ${s.border}`} />
+                        <span className="text-stone-700">{s.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="mb-3">
+                  <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">Yard location (label only)</div>
+                  <div className="space-y-1 text-sm text-stone-700">
+                    {Object.values(YARD_LOCATIONS).map((label) => (
+                      <div key={label} className="flex items-center gap-2">
+                        <MapPin size={13} className="text-stone-400" />
+                        {label}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="mb-3">
+                  <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">Bed structure (label only)</div>
+                  <div className="space-y-1 text-sm text-stone-700">
+                    {Object.values(BED_STRUCTURES).map((label) => (
+                      <div key={label} className="flex items-center gap-2">
+                        <span className="inline-block w-1.5 h-1.5 rounded-full bg-stone-400" />
+                        {label}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">Sun exposure (label only)</div>
+                  <div className="space-y-1 text-sm text-stone-700">
+                    {Object.values(SUN_EXPOSURES).map((label) => (
+                      <div key={label} className="flex items-center gap-2">
+                        <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400" />
+                        {label}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+
+        {/* Canvas */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+            <h2 className="fraunces text-lg text-stone-700">Your land</h2>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-stone-400 mono-label hidden sm:inline">drag to reposition</span>
+              <button
+                type="button"
+                onClick={() => setShowLightZones((s) => !s)}
+                className={`flex items-center gap-1.5 border rounded-lg px-2.5 py-1.5 text-xs font-medium ${
+                  showLightZones
+                    ? "border-cyan-400 bg-cyan-50 text-cyan-800 hover:bg-cyan-100"
+                    : "border-stone-300 bg-white text-stone-500 hover:bg-stone-50"
+                }`}
+                title={showLightZones ? "Hide light zones" : "Show light zones"}
+              >
+                {showLightZones ? <Eye size={14} /> : <EyeOff size={14} />}
+                Light zones
+              </button>
+              <div className="flex items-center border border-stone-300 rounded-lg bg-white overflow-hidden">
+                <button
+                  type="button"
+                  onClick={zoomOut}
+                  disabled={zoom <= ZOOM_MIN}
+                  className="p-1.5 hover:bg-stone-100 disabled:opacity-30 disabled:hover:bg-transparent"
+                  title="Zoom out"
+                >
+                  <ZoomOut size={15} />
+                </button>
+                <button
+                  type="button"
+                  onClick={zoomReset}
+                  className="px-2 text-xs mono-label text-stone-600 hover:bg-stone-100 border-l border-r border-stone-300 h-full py-1.5"
+                  title="Reset zoom to 100%"
+                >
+                  {zoom < 0.1 ? Math.round(zoom * 1000) / 10 : Math.round(zoom * 100)}%
+                </button>
+                <button
+                  type="button"
+                  onClick={zoomIn}
+                  disabled={zoom >= ZOOM_MAX}
+                  className="p-1.5 hover:bg-stone-100 disabled:opacity-30 disabled:hover:bg-transparent border-r border-stone-300"
+                  title="Zoom in"
+                >
+                  <ZoomIn size={15} />
+                </button>
+                <button
+                  type="button"
+                  onClick={zoomToFit}
+                  className="px-2 py-1.5 text-xs font-medium hover:bg-stone-100"
+                  title="Zoom to fit everything on the map"
+                >
+                  Fit all
+                </button>
+              </div>
+              <div
+                className="mono-label text-xs text-stone-500 border border-stone-300 rounded-lg px-2.5 py-1.5 bg-white"
+                title="Each square on the grid always represents this much real ground, no matter how far you zoom in or out"
+              >
+                Square = {GRID_SQUARE_FT}ft
+              </div>
+            </div>
+          </div>
+          <div
+            ref={canvasOuterRef}
+            className="relative bg-stone-200 border border-stone-300 rounded-xl overflow-auto"
+            style={{ height: "82vh", minHeight: 520 }}
+          >
+            {canvasDraw && (
+              <div className="sticky top-0 left-0 z-30 flex items-center justify-between gap-2 bg-white border-b border-stone-300 px-3 py-2 text-sm flex-wrap">
+                <span className="text-stone-600">
+                  {canvasDraw.mode === "edit" ? "Editing shape" : canvasDraw.kind === "zone" ? "Drawing a light zone" : "Drawing a bed"} — click to
+                  place points{canvasDraw.points.length > 0 ? `, ${canvasDraw.points.length} so far` : ""}
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={undoCanvasDrawPoint}
+                    disabled={canvasDraw.points.length === 0}
+                    className="flex items-center gap-1 text-xs border border-stone-300 rounded-lg px-2.5 py-1.5 hover:bg-stone-50 disabled:opacity-40"
+                  >
+                    <Undo2 size={13} /> Undo point
+                  </button>
+                  <button type="button" onClick={cancelCanvasDraw} className="text-xs border border-stone-300 rounded-lg px-2.5 py-1.5 hover:bg-stone-50">
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={finishCanvasDraw}
+                    disabled={canvasDraw.points.length < 3}
+                    className="flex items-center gap-1 text-xs bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-3 py-1.5 disabled:opacity-40"
+                  >
+                    <Check size={13} /> Finish{canvasDraw.mode === "create" ? "" : " editing"}
+                  </button>
+                </div>
+              </div>
+            )}
+            <div style={{ width: contentWidth * zoom, height: canvasHeight * zoom, position: "relative" }}>
+              <div
+                className="absolute top-0 left-0 land-grid pointer-events-none"
+                style={{
+                  width: contentWidth * zoom,
+                  height: canvasHeight * zoom,
+                  backgroundSize: `${FT_TO_PX * GRID_SQUARE_FT * zoom}px ${FT_TO_PX * GRID_SQUARE_FT * zoom}px`,
+                }}
+              />
+              <div
+                ref={canvasRef}
+                className="absolute top-0 left-0"
+                style={{ width: contentWidth, minHeight: canvasHeight, touchAction: "none", transform: `scale(${zoom})`, transformOrigin: "top left" }}
+              >
+            {backgroundImage && showBackgroundImage && (
+              <img
+                src={backgroundImage.dataUrl}
+                alt="Property reference"
+                draggable={false}
+                onMouseDown={backgroundImage.locked ? undefined : (e) => startDrag("image", "bg", e)}
+                onTouchStart={backgroundImage.locked ? undefined : (e) => startDrag("image", "bg", e)}
+                className={`absolute select-none ${backgroundImage.locked ? "pointer-events-none" : "cursor-grab active:cursor-grabbing"}`}
+                style={{
+                  left: backgroundImage.x,
+                  top: backgroundImage.y,
+                  width: backgroundImage.widthPx,
+                  height: backgroundImage.heightPx,
+                  opacity: backgroundImage.opacity,
+                }}
+              />
+            )}
+            {beds.length === 0 && plants.length === 0 && (
+              <div className="absolute inset-0 flex items-center justify-center text-stone-400 text-sm px-6 text-center">
+                Your map is empty. Add a bed or a freestanding plant on the left to get started.
+              </div>
+            )}
+
+            {showLightZones && lightZones.map((zone) => {
+              const style = LIGHT_ZONE_STYLES[zone.sunExposure] || LIGHT_ZONE_STYLES.full_sun;
+              const boxWidthPx = zone.widthFt * FT_TO_PX;
+              const boxHeightPx = zone.lengthFt * FT_TO_PX;
+              const polyString = zone.points.map((p) => `${p.x * FT_TO_PX},${p.y * FT_TO_PX}`).join(" ");
+              return (
+                <div key={zone.id} className="absolute" style={{ left: zone.x, top: zone.y, width: boxWidthPx, height: boxHeightPx }}>
+                  <svg className="absolute inset-0 pointer-events-none" width={boxWidthPx} height={boxHeightPx} style={{ overflow: "visible" }}>
+                    <polygon
+                      points={polyString}
+                      className={`${style.fill} opacity-50`}
+                      stroke="rgba(30,41,59,0.5)"
+                      strokeWidth="2"
+                      strokeDasharray="6 4"
+                    />
+                  </svg>
+                  <div
+                    onMouseDown={(e) => startDrag("zone", zone.id, e)}
+                    onTouchStart={(e) => startDrag("zone", zone.id, e)}
+                    className={`absolute top-0 left-0 inline-flex items-center gap-1 text-xs mono-label px-2 py-0.5 rounded-full border cursor-grab active:cursor-grabbing ${style.badge}`}
+                  >
+                    {SUN_EXPOSURES[zone.sunExposure]}
+                    <button
+                      onClick={() => deleteLightZone(zone.id)}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      className="hover:text-red-600 p-0.5 -m-0.5"
+                      title="Delete zone"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+
+            {beds.map((bed) => (
+              <BedCard
+                key={bed.id}
+                bed={bed}
+                lightZones={lightZones}
+                renaming={renaming}
+                setRenaming={setRenaming}
+                renameInputRef={renameInputRef}
+                commitRename={commitRename}
+                startRename={startRename}
+                bedPlantInputs={bedPlantInputs}
+                setBedPlantInputs={setBedPlantInputs}
+                addPlantToBed={addPlantToBed}
+                ejectPlantFromBed={ejectPlantFromBed}
+                deletePlantFromBed={deletePlantFromBed}
+                setEditingPlant={setEditingPlant}
+                setEditingBed={setEditingBed}
+                startCanvasDrawForBedShape={startCanvasDrawForBedShape}
+                duplicateBed={duplicateBed}
+                deleteBed={deleteBed}
+                startDrag={startDrag}
+                startResizeDrag={startResizeDrag}
+                yearHistory={yearHistory}
+                clearBedHistory={clearBedHistory}
+              />
+            ))}
+
+            {plants.map((plant) => {
+              const isRenaming = renaming && renaming.scope === "free" && renaming.plantId === plant.id;
+              return (
+                <div
+                  key={plant.id}
+                  className="absolute bg-white border border-stone-400 rounded-full shadow-sm flex items-center gap-1.5 pl-3 pr-1.5 py-1 cursor-grab active:cursor-grabbing"
+                  style={{ left: plant.x, top: plant.y }}
+                  onMouseDown={(e) => startDrag("plant", plant.id, e)}
+                  onTouchStart={(e) => startDrag("plant", plant.id, e)}
+                >
+                  <Sprout size={13} className="text-emerald-700 shrink-0" />
+                  {isRenaming ? (
+                    <input
+                      ref={renameInputRef}
+                      value={renaming.text}
+                      onChange={(e) => setRenaming((r) => ({ ...r, text: e.target.value }))}
+                      onBlur={commitRename}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") commitRename();
+                        if (e.key === "Escape") setRenaming(null);
+                      }}
+                      className="w-20 border border-stone-300 rounded px-1 text-xs focus:outline-none"
+                    />
+                  ) : (
+                    <>
+                      <span className="text-xs text-stone-800 whitespace-nowrap">
+                        {plant.name}
+                        {plant.cultivar && <span className="text-stone-500 italic"> ({plant.cultivar})</span>}
+                      </span>
+                      <button
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onClick={() => startRename("free", null, plant.id, plant.name)}
+                        className="text-stone-400 hover:text-stone-700 shrink-0 p-1 -m-1"
+                        title="Rename plant"
+                      >
+                        <Pencil size={11} />
+                      </button>
+                    </>
+                  )}
+                  <button
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={() => setEditingPlant({ scope: "free", bedId: null, plantId: plant.id })}
+                    className="text-stone-400 hover:text-stone-700 shrink-0 p-1 -m-1"
+                    title="Light, water & temperature needs"
+                  >
+                    <Info size={12} />
+                  </button>
+                  {beds.length > 0 && (
+                    <select
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onChange={(e) => movePlantToBed(plant.id, e.target.value)}
+                      value=""
+                      className="text-xs border border-stone-200 rounded bg-stone-50 focus:outline-none"
+                      title="Move into a bed"
+                    >
+                      <option value="">→ bed</option>
+                      {beds.map((b) => (
+                        <option key={b.id} value={b.id}>{b.name}</option>
+                      ))}
+                    </select>
+                  )}
+                  <button
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={() => deleteFreestandingPlant(plant.id)}
+                    className="text-stone-400 hover:text-red-600 shrink-0 p-1 -m-1"
+                    title="Delete plant"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              );
+            })}
+
+            {canvasDraw && (
+              <svg
+                className="absolute top-0 left-0"
+                width={contentWidth}
+                height={canvasHeight}
+                style={{ overflow: "visible", cursor: "crosshair" }}
+                onClick={handleDrawOverlayClick}
+              >
+                <rect x="0" y="0" width={contentWidth} height={canvasHeight} fill="rgba(15,23,42,0.06)" />
+                {canvasDraw.points.length >= 2 && (
+                  <polygon
+                    points={canvasDraw.points.map((p) => `${p.x},${p.y}`).join(" ")}
+                    className={canvasDraw.kind === "zone" ? "fill-cyan-400/30 stroke-cyan-600" : "fill-emerald-400/30 stroke-emerald-600"}
+                    strokeWidth="2"
+                    strokeDasharray="6 4"
+                  />
+                )}
+                {canvasDraw.points.map((p, i) => (
+                  <circle
+                    key={i}
+                    cx={p.x}
+                    cy={p.y}
+                    r="6"
+                    className={canvasDraw.kind === "zone" ? "fill-cyan-600" : "fill-emerald-600"}
+                    stroke="white"
+                    strokeWidth="2"
+                    style={{ cursor: "grab" }}
+                    onMouseDown={(e) => startDrawPointDrag(i, e)}
+                    onTouchStart={(e) => startDrawPointDrag(i, e)}
+                  />
+                ))}
+                {canvasDraw.points.length === 0 && (
+                  <text x={contentWidth / 2} y={40} textAnchor="middle" className="fill-stone-500 text-sm">
+                    Click anywhere on the map to place your first point
+                  </text>
+                )}
+              </svg>
+            )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      )}
+    </div>
+  );
+}

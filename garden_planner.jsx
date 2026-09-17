@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, Fragment } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "react";
 import {
   Trash2, Plus, X, ArrowUpRightFromCircle, Sprout, MapPin,
   PenTool, Undo2, Check, Edit3, Copy, ChevronDown, ChevronRight, Pencil,
@@ -8,7 +8,19 @@ import {
 
 const STORAGE_KEY = "garden-planner-v1";
 const FT_TO_PX = 14;
-const GRID_SQUARE_FT = 4; // each square on the reference grid always represents this many real feet
+// The grid adapts its square size to the current zoom level, the same way a map's scale bar
+// changes as you zoom — a fixed size either turns to visual noise when zoomed out far enough to
+// see a large farm, or feels too coarse when zoomed in on a small garden bed. Uses the standard
+// "1-2-5" sequence (1, 2, 5, 10, 20, 50...) that maps and technical drawings use for round, legible
+// scale steps, picking the finest one that still renders at a comfortably visible size on screen.
+const GRID_SIZE_OPTIONS_FT = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000];
+const MIN_GRID_SCREEN_PX = 45;
+function getAdaptiveGridSizeFt(zoom) {
+  for (const ft of GRID_SIZE_OPTIONS_FT) {
+    if (ft * FT_TO_PX * zoom >= MIN_GRID_SCREEN_PX) return ft;
+  }
+  return GRID_SIZE_OPTIONS_FT[GRID_SIZE_OPTIONS_FT.length - 1];
+}
 
 const SOIL_TYPES = {
   clay: { label: "Clay", swatch: "bg-orange-800", fill: "fill-orange-800", border: "border-orange-900", text: "text-orange-50", chip: "bg-orange-100 text-orange-900 border-orange-300" },
@@ -163,6 +175,10 @@ const PLANT_REFERENCE = {
   raspberry: { perennialNote: "Perennial — plant dormant canes in early spring.", recLight: "full_sun", recWater: "medium", recTemp: "cold_hardy" },
   garlic: { perennialNote: "Usually fall-planted (about 4-6 weeks before your first fall frost) for a summer harvest.", recLight: "full_sun", recWater: "low", recTemp: "cold_hardy" },
 };
+// Precomputed once — PLANT_REFERENCE is a fixed constant, so there's no need to rebuild this
+// array on every single matchPlantReference call (which happens frequently, e.g. once per plant
+// per bed render).
+const PLANT_REFERENCE_KEYS = Object.keys(PLANT_REFERENCE);
 
 // Derives an implied temperature preference from a plant's frost tolerance, when it has one
 // (annual entries) — perennial entries set recTemp explicitly instead, since they don't have "tolerance".
@@ -198,7 +214,7 @@ function matchKeyIn(plantName, keys) {
 }
 
 function matchPlantReference(plantName) {
-  return matchKeyIn(plantName, Object.keys(PLANT_REFERENCE));
+  return matchKeyIn(plantName, PLANT_REFERENCE_KEYS);
 }
 
 // Perennials (berries, etc.) default to "keep" on year rollover since they don't get replanted each year.
@@ -973,19 +989,22 @@ const PLANT_FAMILIES = {
   blueberry: "heath",
   basil: "mint", mint: "mint", rosemary: "mint", thyme: "mint", sage: "mint", oregano: "mint", lavender: "mint", "lemon balm": "mint", catnip: "mint",
 };
+const PLANT_FAMILY_KEYS = Object.keys(PLANT_FAMILIES);
 
 function matchPlantFamily(plantName) {
-  const key = matchKeyIn(plantName, Object.keys(PLANT_FAMILIES));
+  const key = matchKeyIn(plantName, PLANT_FAMILY_KEYS);
   return key ? PLANT_FAMILIES[key] : null;
 }
 
 // Checks whether this plant shares a botanical family with anything grown in a same-named bed
 // in past years — the most recent match wins, since that's the most relevant one to flag.
-function getRotationWarning(bedName, plantName, yearHistory) {
+// Expects sortedYearHistory already sorted most-recent-first — callers that check many plants
+// against the same history (like BedCard, once per plant) sort once and reuse it, rather than
+// re-sorting the same array on every single call.
+function getRotationWarning(bedName, plantName, sortedYearHistory) {
   const family = matchPlantFamily(plantName);
   if (!family || !bedName) return null;
-  const sorted = [...yearHistory].sort((a, b) => new Date(b.archivedAt) - new Date(a.archivedAt));
-  for (const entry of sorted) {
+  for (const entry of sortedYearHistory) {
     const pastBed = entry.beds.find((b) => b.name.trim().toLowerCase() === bedName.trim().toLowerCase());
     if (!pastBed) continue;
     for (const p of pastBed.plants) {
@@ -1046,13 +1065,17 @@ const COMPANION_DATA = {
   geranium: { good: ["cabbage", "corn"], bad: [] },
   chrysanthemum: { good: [], bad: [] },
 };
+const COMPANION_DATA_KEYS = Object.keys(COMPANION_DATA);
 
 function matchCompanionKey(plantName) {
-  return matchKeyIn(plantName, Object.keys(COMPANION_DATA));
+  return matchKeyIn(plantName, COMPANION_DATA_KEYS);
 }
 
 // Compares one plant against a list of other plants (its neighbors) and returns which of them
 // are traditionally good or bad companions, based on name-matching against COMPANION_DATA.
+// neighborPlants may be the full bed (including the plant itself) when plant.id is set — it's
+// skipped internally rather than requiring the caller to pre-filter it out every time. Callers
+// without an id (a plant not yet added to a bed) should keep passing an already-filtered list.
 function getCompanionRelations(plant, neighborPlants) {
   const key = matchCompanionKey(plant.name);
   if (!key) return { key: null, goodNeighbors: [], badNeighbors: [] };
@@ -1060,6 +1083,7 @@ function getCompanionRelations(plant, neighborPlants) {
   const goodNeighbors = [];
   const badNeighbors = [];
   neighborPlants.forEach((n) => {
+    if (plant.id !== undefined && n.id === plant.id) return;
     const nKey = matchCompanionKey(n.name);
     if (!nKey || nKey === key) return;
     const isBad = data.bad.includes(nKey) || (COMPANION_DATA[nKey] && COMPANION_DATA[nKey].bad.includes(key));
@@ -1096,6 +1120,16 @@ function migratePlant(plant) {
     companionWarningsDismissed: plant.companionWarningsDismissed || false,
     rotationWarningsDismissed: plant.rotationWarningsDismissed || false,
   };
+}
+
+// Handles both the old single-image format (backgroundImage) and the current array (backgroundImages),
+// so a save from before multiple images were supported still loads correctly.
+function migrateBackgroundImages(data) {
+  if (Array.isArray(data.backgroundImages)) return data.backgroundImages;
+  if (data.backgroundImage && data.backgroundImage.dataUrl) {
+    return [{ locked: false, ...data.backgroundImage, id: data.backgroundImage.id || nextId() }];
+  }
+  return [];
 }
 
 function migrateBed(bed) {
@@ -1379,7 +1413,9 @@ function PlantDetailsModal({ plantName, initialValues, zone, neighborPlants, bed
   const companion = getCompanionRelations({ name: plantName }, neighborPlants || []);
   const companionRef = companion.key ? COMPANION_DATA[companion.key] : null;
   const recommended = getRecommendedNeeds(plantName);
-  const rotationWarning = bedName ? getRotationWarning(bedName, plantName, yearHistory || []) : null;
+  const rotationWarning = bedName
+    ? getRotationWarning(bedName, plantName, [...(yearHistory || [])].sort((a, b) => new Date(b.archivedAt) - new Date(a.archivedAt)))
+    : null;
 
   const LIGHT_OPTIONS = { recommended: "Recommended (based on plant type)", ...SUN_EXPOSURES };
   const WATER_OPTIONS = { recommended: "Recommended (based on plant type)", ...WATER_NEEDS };
@@ -1603,10 +1639,23 @@ function CalibrationModal({ session, onCancel, onConfirm }) {
   const [referenceFt, setReferenceFt] = useState(session.referenceFt);
   const imgRef = useRef(null);
 
+  // The old approach (fit the whole image within a fixed box) meant a narrow/tall image got
+  // shrunk down to a sliver just a hundred-some pixels wide — clicking a precise reference point
+  // on that is nearly impossible, and small errors get amplified enormously into the final scale.
+  // Instead: guarantee the SHORTER dimension gets enough room to click precisely, even if that
+  // means the LONGER dimension needs to scroll.
   const DISPLAY_MAX = 560;
-  const displayScale = Math.min(DISPLAY_MAX / session.naturalWidth, DISPLAY_MAX / session.naturalHeight, 1);
+  const MIN_DISPLAY_DIM = 320;
+  const naturalMax = Math.max(session.naturalWidth, session.naturalHeight);
+  const naturalMin = Math.min(session.naturalWidth, session.naturalHeight);
+  const fitScale = Math.min(DISPLAY_MAX / naturalMax, 1);
+  const minDimScale = Math.min(MIN_DISPLAY_DIM / naturalMin, 1);
+  const displayScale = Math.max(fitScale, minDimScale);
   const displayWidth = session.naturalWidth * displayScale;
   const displayHeight = session.naturalHeight * displayScale;
+  // Even with the above, a genuinely tiny source image can't be helped further without upscaling
+  // it (which would blur the very thing you're trying to click precisely) — flag that honestly.
+  const limitedPrecision = Math.min(displayWidth, displayHeight) < MIN_DISPLAY_DIM;
 
   function handleClick(e) {
     if (points.length >= 2) return;
@@ -1631,13 +1680,22 @@ function CalibrationModal({ session, onCancel, onConfirm }) {
           building — then tell us how many feet that actually is. This is what lets your traced beds line up with
           real-world measurements.
         </p>
-        <div
-          ref={imgRef}
-          onClick={handleClick}
-          className="relative mx-auto border border-stone-300 rounded-lg overflow-hidden bg-stone-100"
-          style={{ width: displayWidth, height: displayHeight, cursor: points.length < 2 ? "crosshair" : "default" }}
-        >
-          <img src={session.dataUrl} alt="Uploaded reference" className="absolute inset-0 w-full h-full object-cover pointer-events-none" draggable={false} />
+        {limitedPrecision && (
+          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-2 mb-3">
+            This image is quite small ({session.naturalWidth}×{session.naturalHeight}px), so even at full resolution
+            there isn't much room to click precisely. Try to zoom in as much as possible when you click, and pick the
+            longest reference distance you can find in the image — a longer reference line is more forgiving of small
+            clicking errors than a short one. A larger source screenshot will always calibrate more accurately.
+          </p>
+        )}
+        <div className="mx-auto border border-stone-300 rounded-lg bg-stone-100" style={{ maxHeight: "60vh", maxWidth: "100%", overflow: "auto" }}>
+          <div
+            ref={imgRef}
+            onClick={handleClick}
+            className="relative"
+            style={{ width: displayWidth, height: displayHeight, cursor: points.length < 2 ? "crosshair" : "default" }}
+          >
+            <img src={session.dataUrl} alt="Uploaded reference" className="absolute inset-0 w-full h-full object-cover pointer-events-none" draggable={false} />
           <svg className="absolute inset-0 pointer-events-none" width={displayWidth} height={displayHeight}>
             {points.length === 2 && (
               <line
@@ -1654,6 +1712,7 @@ function CalibrationModal({ session, onCancel, onConfirm }) {
               <circle key={i} cx={p.x * displayScale} cy={p.y * displayScale} r="6" fill="rgb(16,185,129)" stroke="white" strokeWidth="2" />
             ))}
           </svg>
+          </div>
         </div>
         <div className="flex items-center justify-between mt-2">
           <p className="text-xs text-stone-400">
@@ -1803,10 +1862,17 @@ function BedCard({
   startResizeDrag,
   yearHistory,
   clearBedHistory,
+  zoom,
 }) {
   const [hovering, setHovering] = useState(false);
   const [pinned, setPinned] = useState(false);
   const showDetails = hovering || pinned;
+  // Sorted once per render and reused for every plant's rotation check below, instead of each
+  // plant re-sorting the same yearHistory array from scratch.
+  const sortedYearHistory = useMemo(
+    () => [...yearHistory].sort((a, b) => new Date(b.archivedAt) - new Date(a.archivedAt)),
+    [yearHistory]
+  );
 
   const soil = SOIL_TYPES[bed.soilType] || SOIL_TYPES.unknown;
   const locationLabel = YARD_LOCATIONS[bed.yardLocation] || YARD_LOCATIONS.unknown;
@@ -1892,9 +1958,8 @@ function BedCard({
           {bed.plants.map((p) => {
             const isRenaming = renaming && renaming.scope === "bed" && renaming.bedId === bed.id && renaming.plantId === p.id;
             const mismatchReason = lightMismatch(bed.sunExposure, resolveNeedValue(p.light, p.name, "light"));
-            const neighbors = bed.plants.filter((other) => other.id !== p.id);
-            const companion = p.companionWarningsDismissed ? { goodNeighbors: [], badNeighbors: [] } : getCompanionRelations(p, neighbors);
-            const rotationWarning = p.rotationWarningsDismissed ? null : getRotationWarning(bed.name, p.name, yearHistory);
+            const companion = p.companionWarningsDismissed ? { goodNeighbors: [], badNeighbors: [] } : getCompanionRelations(p, bed.plants);
+            const rotationWarning = p.rotationWarningsDismissed ? null : getRotationWarning(bed.name, p.name, sortedYearHistory);
             return (
               <span key={p.id} className={`inline-flex items-center gap-1 border rounded-full px-2 py-0.5 text-xs shadow-sm ${soil.chip}`}>
                 {mismatchReason && (
@@ -1977,28 +2042,28 @@ function BedCard({
             onMouseDown={(e) => startResizeDrag(bed.id, "right", e)}
             onTouchStart={(e) => startResizeDrag(bed.id, "right", e)}
             className="absolute bg-emerald-600 border-2 border-white rounded-full shadow"
-            style={{ right: -6, top: "50%", width: 12, height: 28, marginTop: -14, cursor: "ew-resize" }}
+            style={{ right: -6, top: "50%", width: 12, height: 28, marginTop: -14, cursor: "ew-resize", transform: `scale(${1 / zoom})` }}
             title="Drag to resize width"
           />
           <div
             onMouseDown={(e) => startResizeDrag(bed.id, "left", e)}
             onTouchStart={(e) => startResizeDrag(bed.id, "left", e)}
             className="absolute bg-emerald-600 border-2 border-white rounded-full shadow"
-            style={{ left: -6, top: "50%", width: 12, height: 28, marginTop: -14, cursor: "ew-resize" }}
+            style={{ left: -6, top: "50%", width: 12, height: 28, marginTop: -14, cursor: "ew-resize", transform: `scale(${1 / zoom})` }}
             title="Drag to resize width"
           />
           <div
             onMouseDown={(e) => startResizeDrag(bed.id, "bottom", e)}
             onTouchStart={(e) => startResizeDrag(bed.id, "bottom", e)}
             className="absolute bg-emerald-600 border-2 border-white rounded-full shadow"
-            style={{ bottom: -6, left: "50%", width: 28, height: 12, marginLeft: -14, cursor: "ns-resize" }}
+            style={{ bottom: -6, left: "50%", width: 28, height: 12, marginLeft: -14, cursor: "ns-resize", transform: `scale(${1 / zoom})` }}
             title="Drag to resize length"
           />
           <div
             onMouseDown={(e) => startResizeDrag(bed.id, "top", e)}
             onTouchStart={(e) => startResizeDrag(bed.id, "top", e)}
             className="absolute bg-emerald-600 border-2 border-white rounded-full shadow"
-            style={{ top: -6, left: "50%", width: 28, height: 12, marginLeft: -14, cursor: "ns-resize" }}
+            style={{ top: -6, left: "50%", width: 28, height: 12, marginLeft: -14, cursor: "ns-resize", transform: `scale(${1 / zoom})` }}
             title="Drag to resize length"
           />
         </>
@@ -2127,8 +2192,12 @@ export default function GardenPlanner() {
   const [zipStatus, setZipStatus] = useState("idle");
   const [lightZones, setLightZones] = useState([]);
   const [showLightZones, setShowLightZones] = useState(true);
-  const [backgroundImage, setBackgroundImage] = useState(null);
-  const [showBackgroundImage, setShowBackgroundImage] = useState(true);
+  const [showSidebar, setShowSidebar] = useState(true);
+  const [manualGridFt, setManualGridFt] = useState(null);
+  const [viewportWidth, setViewportWidth] = useState(null);
+  const [viewportHeight, setViewportHeight] = useState(null);
+  const [backgroundImages, setBackgroundImages] = useState([]);
+  const [showBackgroundImages, setShowBackgroundImages] = useState(true);
   const [calibrationSession, setCalibrationSession] = useState(null);
   const imageFileInputRef = useRef(null);
   const [yearHistory, setYearHistory] = useState([]);
@@ -2158,8 +2227,6 @@ export default function GardenPlanner() {
   const [editingPlant, setEditingPlant] = useState(null); // { scope: 'bed'|'free', bedId, plantId } | null
   const [renaming, setRenaming] = useState(null); // { scope: 'bed'|'free', bedId, plantId, text }
   const canvasRef = useRef(null);
-  const dragRef = useRef(null);
-  const resizeRef = useRef(null);
   const renameInputRef = useRef(null);
 
   const [imageSaveWarning, setImageSaveWarning] = useState("");
@@ -2177,7 +2244,7 @@ export default function GardenPlanner() {
           setLightZones(data.lightZones || []);
           setYearHistory(data.yearHistory || []);
           setJournalEntries(data.journalEntries || []);
-          setBackgroundImage(data.backgroundImage || null);
+          setBackgroundImages(migrateBackgroundImages(data));
         }
       } catch (e) {
         // no saved data yet
@@ -2187,7 +2254,7 @@ export default function GardenPlanner() {
   }, []);
 
   const persist = useCallback(
-    async (nextBeds, nextPlants, nextZone, nextZoneCustomText, nextLightZones, nextYearHistory, nextJournalEntries, nextBackgroundImage) => {
+    async (nextBeds, nextPlants, nextZone, nextZoneCustomText, nextLightZones, nextYearHistory, nextJournalEntries, nextBackgroundImages) => {
       const basePayload = {
         beds: nextBeds,
         plants: nextPlants,
@@ -2198,15 +2265,19 @@ export default function GardenPlanner() {
         journalEntries: nextJournalEntries,
       };
       try {
-        await window.storage.set(STORAGE_KEY, JSON.stringify({ ...basePayload, backgroundImage: nextBackgroundImage }));
-        if (imageSaveWarning) setImageSaveWarning("");
+        await window.storage.set(STORAGE_KEY, JSON.stringify({ ...basePayload, backgroundImages: nextBackgroundImages }));
+        // Unconditional — React bails out of a re-render if this is already "", so no need to read
+        // imageSaveWarning here. Reading it would make persist's own identity change whenever the
+        // warning changes, which (since persist is itself a dependency of the debounced save effect)
+        // would reset that debounce every time, adding an extra delay cycle right when a save just failed.
+        setImageSaveWarning("");
       } catch (e) {
-        // Most likely the browser's storage quota was exceeded by the image. Don't let that take the rest of
-        // the garden's data down with it — retry without the image so beds/plants/etc. still save correctly.
-        if (nextBackgroundImage) {
+        // Most likely the browser's storage quota was exceeded by the images. Don't let that take the rest of
+        // the garden's data down with it — retry without any images so beds/plants/etc. still save correctly.
+        if (nextBackgroundImages && nextBackgroundImages.length > 0) {
           try {
-            await window.storage.set(STORAGE_KEY, JSON.stringify({ ...basePayload, backgroundImage: null }));
-            setImageSaveWarning("Your uploaded image is too large to save in this browser — everything else saved fine, but the image won't survive a reload. Try a smaller image.");
+            await window.storage.set(STORAGE_KEY, JSON.stringify({ ...basePayload, backgroundImages: [] }));
+            setImageSaveWarning("Your uploaded image(s) are too large to save in this browser — everything else saved fine, but the images won't survive a reload. Try smaller or fewer images.");
           } catch (e2) {
             console.error("Could not save garden data", e2);
           }
@@ -2215,13 +2286,54 @@ export default function GardenPlanner() {
         }
       }
     },
-    [imageSaveWarning]
+    []
   );
+
+  // Keeps the latest garden-data snapshot available to the safety-net flush below, updated cheaply
+  // (just an object assignment, no serialization) on every relevant change.
+  const latestSaveDataRef = useRef(null);
+  useEffect(() => {
+    latestSaveDataRef.current = { beds, plants, zone, zoneCustomText, lightZones, yearHistory, journalEntries, backgroundImages };
+  }, [beds, plants, zone, zoneCustomText, lightZones, yearHistory, journalEntries, backgroundImages]);
+
+  // Debounced so a fast-changing drag (a bed, plant, or image moving through dozens of positions a
+  // second) doesn't trigger a full JSON.stringify-and-write on every single intermediate step — only
+  // once the data has actually settled. The flush effect right after this one is the safety net: if
+  // the tab is hidden or closed while a debounced save is still pending, it's written immediately
+  // instead of being silently lost to the delay.
+  const persistTimeoutRef = useRef(null);
+  useEffect(() => {
+    if (!loaded) return;
+    persistTimeoutRef.current = setTimeout(() => {
+      persistTimeoutRef.current = null;
+      persist(beds, plants, zone, zoneCustomText, lightZones, yearHistory, journalEntries, backgroundImages);
+    }, 500);
+    return () => {
+      if (persistTimeoutRef.current) clearTimeout(persistTimeoutRef.current);
+    };
+  }, [beds, plants, zone, zoneCustomText, lightZones, yearHistory, journalEntries, backgroundImages, loaded, persist]);
 
   useEffect(() => {
     if (!loaded) return;
-    persist(beds, plants, zone, zoneCustomText, lightZones, yearHistory, journalEntries, backgroundImage);
-  }, [beds, plants, zone, zoneCustomText, lightZones, yearHistory, journalEntries, backgroundImage, loaded, persist]);
+    const flushIfPending = () => {
+      if (!persistTimeoutRef.current) return;
+      clearTimeout(persistTimeoutRef.current);
+      persistTimeoutRef.current = null;
+      const d = latestSaveDataRef.current;
+      if (d) persist(d.beds, d.plants, d.zone, d.zoneCustomText, d.lightZones, d.yearHistory, d.journalEntries, d.backgroundImages);
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) flushIfPending();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("beforeunload", flushIfPending);
+    window.addEventListener("pagehide", flushIfPending);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("beforeunload", flushIfPending);
+      window.removeEventListener("pagehide", flushIfPending);
+    };
+  }, [loaded, persist]);
 
   useEffect(() => {
     if (bedForm.name.trim()) setBedNameError(false);
@@ -2268,10 +2380,10 @@ export default function GardenPlanner() {
       xs.push(z.x, z.x + z.widthFt * FT_TO_PX);
       ys.push(z.y, z.y + z.lengthFt * FT_TO_PX);
     });
-    if (backgroundImage) {
-      xs.push(backgroundImage.x, backgroundImage.x + backgroundImage.widthPx);
-      ys.push(backgroundImage.y, backgroundImage.y + backgroundImage.heightPx);
-    }
+    backgroundImages.forEach((bgImg) => {
+      xs.push(bgImg.x, bgImg.x + bgImg.widthPx);
+      ys.push(bgImg.y, bgImg.y + bgImg.heightPx);
+    });
     if (xs.length === 0) {
       setZoom(1);
       return;
@@ -2494,7 +2606,7 @@ export default function GardenPlanner() {
       lightZones,
       yearHistory,
       journalEntries,
-      backgroundImage,
+      backgroundImages,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -2536,7 +2648,7 @@ export default function GardenPlanner() {
         setLightZones(Array.isArray(data.lightZones) ? data.lightZones : []);
         setYearHistory(Array.isArray(data.yearHistory) ? data.yearHistory : []);
         setJournalEntries(Array.isArray(data.journalEntries) ? data.journalEntries : []);
-        setBackgroundImage(data.backgroundImage && data.backgroundImage.dataUrl ? data.backgroundImage : null);
+        setBackgroundImages(migrateBackgroundImages(data));
         setImportError("");
       } catch (err) {
         setImportError("Couldn't read that file — it may not be a valid backup.");
@@ -2569,7 +2681,7 @@ export default function GardenPlanner() {
           w = targetW;
           h = targetH;
         }
-        setCalibrationSession({ dataUrl, naturalWidth: w, naturalHeight: h, points: [], referenceFt: "" });
+        setCalibrationSession({ dataUrl, naturalWidth: w, naturalHeight: h, points: [], referenceFt: "", existingImageId: null });
       };
       img.src = reader.result;
     };
@@ -2583,18 +2695,23 @@ export default function GardenPlanner() {
     const ftPerNativePx = Number(referenceFt) / pixelDist;
     const widthPx = naturalWidth * ftPerNativePx * FT_TO_PX;
     const heightPx = naturalHeight * ftPerNativePx * FT_TO_PX;
-    // Recalibrating an existing image keeps its current position/opacity — only a brand-new upload starts fresh.
-    const isRecalibration = backgroundImage && backgroundImage.dataUrl === dataUrl;
-    setBackgroundImage({
-      dataUrl,
-      x: isRecalibration ? backgroundImage.x : 24,
-      y: isRecalibration ? backgroundImage.y : 24,
-      widthPx,
-      heightPx,
-      opacity: isRecalibration ? backgroundImage.opacity : 0.85,
-      locked: false,
-    });
+    const existingImageId = calibrationSession && calibrationSession.existingImageId;
+    if (existingImageId) {
+      // Recalibrating an existing image keeps its position/opacity/lock — only the scale changes.
+      setBackgroundImages((prev) =>
+        prev.map((img) => (img.id === existingImageId ? { ...img, dataUrl, widthPx, heightPx, naturalWidth, naturalHeight } : img))
+      );
+    } else {
+      setBackgroundImages((prev) => [
+        ...prev,
+        { id: nextId(), dataUrl, x: 24, y: 24, widthPx, heightPx, naturalWidth, naturalHeight, opacity: 0.85, locked: false },
+      ]);
+    }
     setCalibrationSession(null);
+  }
+
+  function deleteBackgroundImage(id) {
+    setBackgroundImages((prev) => prev.filter((img) => img.id !== id));
   }
 
   function addJournalEntry(entry) {
@@ -2803,129 +2920,242 @@ export default function GardenPlanner() {
     setRenaming(null);
   }
 
-  const startDrag = (kind, id, e) => {
+  // Shared plumbing for every drag/resize interaction in the app (bed/plant/zone/image move, bed
+  // resize, image resize, viewport resize) — the parts that are truly identical everywhere: mouse vs
+  // touch coordinate normalization, and registering/cleaning up the window-level listeners. Each call
+  // site still owns its own start-state shape, its move math, and any end-of-drag side effects; only
+  // the boilerplate that was previously copy-pasted five times lives here now.
+  const dragSessionRef = useRef(null);
+
+  const handleDragSessionMove = useCallback((e) => {
+    const session = dragSessionRef.current;
+    if (!session) return;
     e.preventDefault();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    session.onMove(session.state, clientX, clientY);
+  }, []);
+
+  const handleDragSessionEnd = useCallback(() => {
+    const session = dragSessionRef.current;
+    dragSessionRef.current = null;
+    window.removeEventListener("mousemove", handleDragSessionMove);
+    window.removeEventListener("mouseup", handleDragSessionEnd);
+    window.removeEventListener("touchmove", handleDragSessionMove);
+    window.removeEventListener("touchend", handleDragSessionEnd);
+    if (session && session.onEnd) session.onEnd(session.state);
+  }, [handleDragSessionMove]);
+
+  // e: the originating mousedown/touchstart event. initialState: whatever the caller needs on every
+  // move (captured once, at drag start — the same "snapshot the starting values" pattern every one
+  // of these systems already used individually). onMove(state, clientX, clientY): run on every move.
+  // onEnd(state): run once on release, before the session is cleared. stopPropagation: only some
+  // handles (ones nested inside other draggable content, like a resize handle on a bed) need this,
+  // to avoid also triggering the parent's own drag.
+  function startDragSession(e, initialState, onMove, onEnd, { stopPropagation = false } = {}) {
+    e.preventDefault();
+    if (stopPropagation) e.stopPropagation();
+    dragSessionRef.current = { state: initialState, onMove, onEnd };
+    window.addEventListener("mousemove", handleDragSessionMove);
+    window.addEventListener("mouseup", handleDragSessionEnd);
+    window.addEventListener("touchmove", handleDragSessionMove, { passive: false });
+    window.addEventListener("touchend", handleDragSessionEnd);
+  }
+
+  const startDrag = (kind, id, e) => {
     const canvasRect = canvasRef.current.getBoundingClientRect();
-    const list = kind === "bed" ? beds : kind === "zone" ? lightZones : kind === "image" ? [backgroundImage] : plants;
-    const item = kind === "image" ? backgroundImage : list.find((i) => i.id === id);
+    const list = kind === "bed" ? beds : kind === "zone" ? lightZones : kind === "image" ? backgroundImages : plants;
+    const item = list.find((i) => i.id === id);
     if (!item) return;
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    dragRef.current = {
-      kind,
-      id,
-      offsetX: (clientX - canvasRect.left) / zoom - item.x,
-      offsetY: (clientY - canvasRect.top) / zoom - item.y,
-    };
-    window.addEventListener("mousemove", onDragMove);
-    window.addEventListener("mouseup", onDragEnd);
-    window.addEventListener("touchmove", onDragMove, { passive: false });
-    window.addEventListener("touchend", onDragEnd);
-  };
-
-  const onDragMove = (e) => {
-    if (!dragRef.current || !canvasRef.current) return;
-    e.preventDefault();
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    const canvasRect = canvasRef.current.getBoundingClientRect();
-    const { kind, id, offsetX, offsetY } = dragRef.current;
-    let x = (clientX - canvasRect.left) / zoom - offsetX;
-    let y = (clientY - canvasRect.top) / zoom - offsetY;
-    x = Math.max(0, x);
-    y = Math.max(0, y);
-    if (kind === "bed") setBeds((prev) => prev.map((b) => (b.id === id ? { ...b, x, y } : b)));
-    else if (kind === "zone") setLightZones((prev) => prev.map((z) => (z.id === id ? { ...z, x, y } : z)));
-    else if (kind === "image") setBackgroundImage((prev) => (prev ? { ...prev, x, y } : prev));
-    else setPlants((prev) => prev.map((p) => (p.id === id ? { ...p, x, y } : p)));
-  };
-
-  const onDragEnd = () => {
-    const finished = dragRef.current;
-    dragRef.current = null;
-    window.removeEventListener("mousemove", onDragMove);
-    window.removeEventListener("mouseup", onDragEnd);
-    window.removeEventListener("touchmove", onDragMove);
-    window.removeEventListener("touchend", onDragEnd);
-
-    // If a bed the user hasn't manually set was just moved, re-check where it landed relative to the light zones.
-    if (finished && finished.kind === "bed") {
-      setBeds((prev) =>
-        prev.map((bed) => {
-          if (bed.id !== finished.id || bed.sunExposureSource === "manual") return bed;
-          const suggestion = suggestSunForBed(bed, lightZones, FT_TO_PX);
-          if (suggestion) return { ...bed, sunExposure: suggestion, sunExposureSource: "auto" };
-          return { ...bed, sunExposure: "unknown", sunExposureSource: "unset" };
-        })
-      );
-    }
+    startDragSession(
+      e,
+      { kind, id, offsetX: (clientX - canvasRect.left) / zoom - item.x, offsetY: (clientY - canvasRect.top) / zoom - item.y },
+      (state, moveClientX, moveClientY) => {
+        if (!canvasRef.current) return;
+        const rect = canvasRef.current.getBoundingClientRect();
+        const { kind, id, offsetX, offsetY } = state;
+        let x = (moveClientX - rect.left) / zoom - offsetX;
+        let y = (moveClientY - rect.top) / zoom - offsetY;
+        x = Math.max(0, x);
+        y = Math.max(0, y);
+        if (kind === "bed") setBeds((prev) => prev.map((b) => (b.id === id ? { ...b, x, y } : b)));
+        else if (kind === "zone") setLightZones((prev) => prev.map((z) => (z.id === id ? { ...z, x, y } : z)));
+        else if (kind === "image") setBackgroundImages((prev) => prev.map((img) => (img.id === id ? { ...img, x, y } : img)));
+        else setPlants((prev) => prev.map((p) => (p.id === id ? { ...p, x, y } : p)));
+      },
+      (state) => {
+        // If a bed the user hasn't manually set was just moved, re-check where it landed relative to the light zones.
+        if (state.kind === "bed") {
+          setBeds((prev) =>
+            prev.map((bed) => {
+              if (bed.id !== state.id || bed.sunExposureSource === "manual") return bed;
+              const suggestion = suggestSunForBed(bed, lightZones, FT_TO_PX);
+              if (suggestion) return { ...bed, sunExposure: suggestion, sunExposureSource: "auto" };
+              return { ...bed, sunExposure: "unknown", sunExposureSource: "unset" };
+            })
+          );
+        }
+      }
+    );
   };
 
   // Resizing a bed by dragging one of its edge handles. Dragging the right/bottom edge changes
   // that dimension directly; dragging the left/top edge changes the dimension AND shifts the bed's
   // position so the opposite edge stays put — standard resize-handle behavior.
   const startResizeDrag = (bedId, edge, e) => {
-    e.preventDefault();
-    e.stopPropagation();
     const bed = beds.find((b) => b.id === bedId);
     if (!bed) return;
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    resizeRef.current = {
-      bedId,
-      edge,
-      startClientX: clientX,
-      startClientY: clientY,
-      startWidthFt: bed.widthFt,
-      startLengthFt: bed.lengthFt,
-      startX: bed.x,
-      startY: bed.y,
-    };
-    window.addEventListener("mousemove", onResizeMove);
-    window.addEventListener("mouseup", onResizeEnd);
-    window.addEventListener("touchmove", onResizeMove, { passive: false });
-    window.addEventListener("touchend", onResizeEnd);
-  };
-
-  const onResizeMove = (e) => {
-    if (!resizeRef.current) return;
-    e.preventDefault();
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    const { bedId, edge, startClientX, startClientY, startWidthFt, startLengthFt, startX, startY } = resizeRef.current;
-    const deltaXFt = (clientX - startClientX) / zoom / FT_TO_PX;
-    const deltaYFt = (clientY - startClientY) / zoom / FT_TO_PX;
-    const MIN_FT = 1;
-
-    setBeds((prev) =>
-      prev.map((bed) => {
-        if (bed.id !== bedId) return bed;
-        let widthFt = startWidthFt;
-        let lengthFt = startLengthFt;
-        let x = startX;
-        let y = startY;
-        if (edge === "right") {
-          widthFt = Math.max(MIN_FT, startWidthFt + deltaXFt);
-        } else if (edge === "left") {
-          widthFt = Math.max(MIN_FT, startWidthFt - deltaXFt);
-          x = startX + (startWidthFt - widthFt) * FT_TO_PX;
-        } else if (edge === "bottom") {
-          lengthFt = Math.max(MIN_FT, startLengthFt + deltaYFt);
-        } else if (edge === "top") {
-          lengthFt = Math.max(MIN_FT, startLengthFt - deltaYFt);
-          y = startY + (startLengthFt - lengthFt) * FT_TO_PX;
-        }
-        return { ...bed, widthFt, lengthFt, x: Math.max(0, x), y: Math.max(0, y), approxSqFt: Math.round(widthFt * lengthFt) };
-      })
+    startDragSession(
+      e,
+      { bedId, edge, startClientX: clientX, startClientY: clientY, startWidthFt: bed.widthFt, startLengthFt: bed.lengthFt, startX: bed.x, startY: bed.y },
+      (state, moveClientX, moveClientY) => {
+        const { bedId, edge, startClientX, startClientY, startWidthFt, startLengthFt, startX, startY } = state;
+        const deltaXFt = (moveClientX - startClientX) / zoom / FT_TO_PX;
+        const deltaYFt = (moveClientY - startClientY) / zoom / FT_TO_PX;
+        const MIN_FT = 1;
+        setBeds((prev) =>
+          prev.map((bed) => {
+            if (bed.id !== bedId) return bed;
+            let widthFt = startWidthFt;
+            let lengthFt = startLengthFt;
+            let x = startX;
+            let y = startY;
+            if (edge === "right") {
+              widthFt = Math.max(MIN_FT, startWidthFt + deltaXFt);
+            } else if (edge === "left") {
+              // The right edge must stay exactly where it was — derive width from the ACTUAL
+              // (post-clamp) x, not the other way around, so hitting the canvas boundary can't
+              // silently shift the edge the user isn't even dragging.
+              const rightEdgePx = startX + startWidthFt * FT_TO_PX;
+              x = Math.max(0, startX + deltaXFt * FT_TO_PX);
+              widthFt = Math.max(MIN_FT, (rightEdgePx - x) / FT_TO_PX);
+            } else if (edge === "bottom") {
+              lengthFt = Math.max(MIN_FT, startLengthFt + deltaYFt);
+            } else if (edge === "top") {
+              const bottomEdgePx = startY + startLengthFt * FT_TO_PX;
+              y = Math.max(0, startY + deltaYFt * FT_TO_PX);
+              lengthFt = Math.max(MIN_FT, (bottomEdgePx - y) / FT_TO_PX);
+            }
+            return { ...bed, widthFt, lengthFt, x: Math.max(0, x), y: Math.max(0, y), approxSqFt: Math.round(widthFt * lengthFt) };
+          })
+        );
+      },
+      null,
+      { stopPropagation: true }
     );
   };
 
-  const onResizeEnd = () => {
-    resizeRef.current = null;
-    window.removeEventListener("mousemove", onResizeMove);
-    window.removeEventListener("mouseup", onResizeEnd);
-    window.removeEventListener("touchmove", onResizeMove);
-    window.removeEventListener("touchend", onResizeEnd);
+  // Separate, simpler resize system for background images — proportional only (drag the corner,
+  // both dimensions scale together) so a photo can't get stretched out of its real aspect ratio.
+  const startImageResize = (imageId, e) => {
+    const img = backgroundImages.find((b) => b.id === imageId);
+    if (!img) return;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    startDragSession(
+      e,
+      { imageId, startClientX: clientX, startWidthPx: img.widthPx, startHeightPx: img.heightPx },
+      (state, moveClientX) => {
+        // Deliberately horizontal-only — moveClientY is intentionally unused here.
+        const { imageId, startClientX, startWidthPx, startHeightPx } = state;
+        const deltaX = (moveClientX - startClientX) / zoom;
+        const scale = Math.max(0.05, (startWidthPx + deltaX) / startWidthPx);
+        setBackgroundImages((prev) =>
+          prev.map((img) => (img.id === imageId ? { ...img, widthPx: startWidthPx * scale, heightPx: startHeightPx * scale } : img))
+        );
+      },
+      null,
+      { stopPropagation: true }
+    );
+  };
+
+
+  // Independent per-edge resize for images, matching a Paint-style box resize — drag the right
+  // side and only the width grows (to the right); drag the left side and it grows to the left, etc.
+  // Unlike the corner handle above, this can distort the image's proportions on purpose.
+  const startImageEdgeResize = (imageId, edge, e) => {
+    const img = backgroundImages.find((b) => b.id === imageId);
+    if (!img) return;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    startDragSession(
+      e,
+      { imageId, edge, startClientX: clientX, startClientY: clientY, startWidthPx: img.widthPx, startHeightPx: img.heightPx, startX: img.x, startY: img.y },
+      (state, moveClientX, moveClientY) => {
+        const { imageId, edge, startClientX, startClientY, startWidthPx, startHeightPx, startX, startY } = state;
+        const deltaX = (moveClientX - startClientX) / zoom;
+        const deltaY = (moveClientY - startClientY) / zoom;
+        const MIN_PX = 20;
+        setBackgroundImages((prev) =>
+          prev.map((img) => {
+            if (img.id !== imageId) return img;
+            let widthPx = startWidthPx;
+            let heightPx = startHeightPx;
+            let x = startX;
+            let y = startY;
+            // Independent per-axis checks (not else-if across axes) so a compound corner value like
+            // "bottom-right" resizes width AND height together; a plain edge like "right" only matches
+            // one of these and leaves the other axis untouched, exactly as before.
+            if (edge.includes("right")) {
+              widthPx = Math.max(MIN_PX, startWidthPx + deltaX);
+            } else if (edge.includes("left")) {
+              // The right edge must stay exactly where it was — derive width from the ACTUAL
+              // (post-clamp) x, so hitting the canvas boundary can't silently shift the opposite edge.
+              const rightEdgePx = startX + startWidthPx;
+              x = Math.max(0, startX + deltaX);
+              widthPx = Math.max(MIN_PX, rightEdgePx - x);
+            }
+            if (edge.includes("bottom")) {
+              heightPx = Math.max(MIN_PX, startHeightPx + deltaY);
+            } else if (edge.includes("top")) {
+              const bottomEdgePx = startY + startHeightPx;
+              y = Math.max(0, startY + deltaY);
+              heightPx = Math.max(MIN_PX, bottomEdgePx - y);
+            }
+            return { ...img, widthPx, heightPx, x: Math.max(0, x), y: Math.max(0, y) };
+          })
+        );
+      },
+      null,
+      { stopPropagation: true }
+    );
+  };
+
+  // Lets you drag "Your land" itself to whatever size/shape you want — a plain screen-pixel resize
+  // of the viewport chrome, completely unrelated to zoom or the ft-based content inside it.
+  const startViewportResize = (edge, e) => {
+    const el = canvasOuterRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    // Real browsers can start a native text-selection drag alongside a mousedown on nearby content,
+    // which can visibly interfere with a resize drag in ways a headless test environment doesn't
+    // reproduce — disable selection for the duration of the drag as a defensive measure.
+    document.body.style.userSelect = "none";
+    startDragSession(
+      e,
+      { edge, startClientX: clientX, startClientY: clientY, startWidth: rect.width, startHeight: rect.height, startLeft: rect.left, startTop: rect.top },
+      (state, moveClientX, moveClientY) => {
+        const { edge, startClientX, startClientY, startWidth, startHeight, startLeft, startTop } = state;
+        // Cap so the handle's corner can never end up past the visible browser window — otherwise
+        // you'd have to scroll the whole page just to reach it again to size it back down.
+        const maxWidth = window.innerWidth - startLeft - 16;
+        const maxHeight = window.innerHeight - startTop - 16;
+        if (edge === "right" || edge === "corner") {
+          setViewportWidth(Math.min(maxWidth, Math.max(320, startWidth + (moveClientX - startClientX))));
+        }
+        if (edge === "bottom" || edge === "corner") {
+          setViewportHeight(Math.min(maxHeight, Math.max(300, startHeight + (moveClientY - startClientY))));
+        }
+      },
+      () => {
+        document.body.style.userSelect = "";
+      }
+    );
   };
 
   // The canvas must always be at least large enough that, once scaled by the current zoom,
@@ -2933,28 +3163,37 @@ export default function GardenPlanner() {
   // shrinks a same-sized canvas into the corner of that fixed box, leaving blank space around
   // it and making the visible grid block's proportions look wrong ("misshapen squares").
   const viewportFillWidth = baseWidth / zoom;
+  const activeGridFt = manualGridFt !== null ? manualGridFt : getAdaptiveGridSizeFt(zoom);
   const viewportFillHeight = baseHeight / zoom;
 
-  const canvasHeight = Math.max(
-    640,
-    viewportFillHeight,
-    ...beds.map((b) => b.y + b.lengthFt * FT_TO_PX + 60),
-    ...plants.map((p) => p.y + 60),
-    ...lightZones.map((z) => z.y + z.lengthFt * FT_TO_PX + 60),
-    backgroundImage ? backgroundImage.y + backgroundImage.heightPx + 60 : 0,
-    0
+  const canvasHeight = useMemo(
+    () =>
+      Math.max(
+        640,
+        viewportFillHeight,
+        ...beds.map((b) => b.y + b.lengthFt * FT_TO_PX + 60),
+        ...plants.map((p) => p.y + 60),
+        ...lightZones.map((z) => z.y + z.lengthFt * FT_TO_PX + 60),
+        ...backgroundImages.map((bgImg) => bgImg.y + bgImg.heightPx + 60),
+        0
+      ),
+    [beds, plants, lightZones, backgroundImages, viewportFillHeight]
   );
   // The canvas needs to be as wide as whatever's actually placed on it, not just the viewport —
   // otherwise the reference grid (and the scrollable area) stop short of beds placed far out,
   // which is exactly the "squares don't cover the full land" problem on large properties.
-  const contentWidth = Math.max(
-    baseWidth,
-    viewportFillWidth,
-    ...beds.map((b) => b.x + b.widthFt * FT_TO_PX + 60),
-    ...plants.map((p) => p.x + 100),
-    ...lightZones.map((z) => z.x + z.widthFt * FT_TO_PX + 60),
-    backgroundImage ? backgroundImage.x + backgroundImage.widthPx + 60 : 0,
-    0
+  const contentWidth = useMemo(
+    () =>
+      Math.max(
+        baseWidth,
+        viewportFillWidth,
+        ...beds.map((b) => b.x + b.widthFt * FT_TO_PX + 60),
+        ...plants.map((p) => p.x + 100),
+        ...lightZones.map((z) => z.x + z.widthFt * FT_TO_PX + 60),
+        ...backgroundImages.map((bgImg) => bgImg.x + bgImg.widthPx + 60),
+        0
+      ),
+    [beds, plants, lightZones, backgroundImages, baseWidth, viewportFillWidth]
   );
 
   // Converts a mouse/touch event's screen position into the canvas's own logical coordinate space
@@ -3189,9 +3428,11 @@ export default function GardenPlanner() {
       ) : activeTab === "journal" ? (
         <JournalView journalEntries={journalEntries} beds={beds} onAddEntry={addJournalEntry} onDeleteEntry={deleteJournalEntry} />
       ) : (
-      <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6 flex flex-col sm:flex-row gap-4 sm:gap-6">
-        {/* Sidebar */}
-        <div className="space-y-4 sm:space-y-6 w-full sm:w-64 md:w-72 lg:w-80 sm:flex-shrink-0">
+      <div className="mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6 flex flex-col sm:flex-row gap-4 sm:gap-6">
+        {/* Sidebar — back on the left, in natural order. Note: order alone doesn't change how much
+            space each side gets (a fixed-width panel takes the same room either way) — collapsing it
+            via the toggle is still what actually reclaims width for Your land. */}
+        <div className={`space-y-4 sm:space-y-6 w-full sm:w-64 md:w-72 lg:w-80 sm:flex-shrink-0 order-1 ${showSidebar ? "" : "hidden"}`}>
           <section className="bg-white border border-stone-300 rounded-xl p-4">
             <h2 className="fraunces text-lg mb-3 flex items-center gap-2">
               <Plus size={18} className="text-emerald-700" /> Add a bed
@@ -3268,11 +3509,12 @@ export default function GardenPlanner() {
 
           <section className="bg-white border border-stone-300 rounded-xl p-4">
             <h2 className="fraunces text-lg mb-2 flex items-center gap-2">
-              <ImageIcon size={18} className="text-emerald-700" /> Satellite / aerial image
+              <ImageIcon size={18} className="text-emerald-700" /> Satellite / aerial images
             </h2>
             <p className="text-xs text-stone-500 mb-3">
-              Upload a screenshot of your property from Google Maps or similar, calibrate it to a known real-world
-              distance, then use "Custom — draw it yourself" for beds to trace directly over it.
+              Upload one or more screenshots of your property from Google Maps or similar — piece together sections
+              if one image doesn't cover it all. Calibrate each to a known real-world distance, then use "Custom —
+              draw it yourself" for beds to trace directly over them.
             </p>
             <input ref={imageFileInputRef} type="file" accept="image/*" onChange={handleImageFile} className="hidden" />
             {imageSaveWarning && (
@@ -3280,83 +3522,103 @@ export default function GardenPlanner() {
                 {imageSaveWarning}
               </p>
             )}
-            {!backgroundImage ? (
-              <button
-                type="button"
-                onClick={() => imageFileInputRef.current && imageFileInputRef.current.click()}
-                className="w-full flex items-center justify-center gap-2 border border-emerald-700 text-emerald-700 rounded-lg py-2 text-sm font-medium hover:bg-emerald-50"
-              >
-                <Upload size={15} />
-                Upload an image
-              </button>
-            ) : (
-              <div className="space-y-3">
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowBackgroundImage((s) => !s)}
-                    className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border border-stone-300 hover:bg-stone-50"
-                  >
-                    {showBackgroundImage ? <Eye size={13} /> : <EyeOff size={13} />}
-                    {showBackgroundImage ? "Visible" : "Hidden"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setBackgroundImage((prev) => (prev ? { ...prev, locked: !prev.locked } : prev))}
-                    className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border ${
-                      backgroundImage.locked ? "border-emerald-600 bg-emerald-50 text-emerald-800" : "border-stone-300 hover:bg-stone-50"
-                    }`}
-                    title={backgroundImage.locked ? "Unlock to reposition the image" : "Lock the image in place to avoid nudging it by accident"}
-                  >
-                    {backgroundImage.locked ? <Lock size={13} /> : <Unlock size={13} />}
-                    {backgroundImage.locked ? "Locked" : "Unlocked"}
-                  </button>
-                </div>
-                <div className="flex items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const img = new window.Image();
-                      img.onload = () =>
-                        setCalibrationSession({
-                          dataUrl: backgroundImage.dataUrl,
-                          naturalWidth: img.naturalWidth,
-                          naturalHeight: img.naturalHeight,
-                          points: [],
-                          referenceFt: "",
-                        });
-                      img.src = backgroundImage.dataUrl;
-                    }}
-                    className="text-xs text-stone-500 hover:text-emerald-700 underline"
-                  >
-                    Recalibrate
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (window.confirm("Remove the uploaded image from your map?")) setBackgroundImage(null);
-                    }}
-                    className="text-xs text-stone-500 hover:text-red-600 underline"
-                  >
-                    Remove
-                  </button>
-                </div>
-                <div>
-                  <label className="text-xs mono-label text-stone-500 block mb-1">Opacity</label>
-                  <input
-                    type="range"
-                    min="0.1"
-                    max="1"
-                    step="0.05"
-                    value={backgroundImage.opacity}
-                    onChange={(e) => setBackgroundImage((prev) => ({ ...prev, opacity: Number(e.target.value) }))}
-                    className="w-full"
-                  />
+            <button
+              type="button"
+              onClick={() => imageFileInputRef.current && imageFileInputRef.current.click()}
+              className="w-full flex items-center justify-center gap-2 border border-emerald-700 text-emerald-700 rounded-lg py-2 text-sm font-medium hover:bg-emerald-50"
+            >
+              <Upload size={15} />
+              {backgroundImages.length === 0 ? "Upload an image" : "Upload another image"}
+            </button>
+
+            {backgroundImages.length > 0 && (
+              <div className="mt-3 space-y-3">
+                <button
+                  type="button"
+                  onClick={() => setShowBackgroundImages((s) => !s)}
+                  className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border border-stone-300 hover:bg-stone-50"
+                >
+                  {showBackgroundImages ? <Eye size={13} /> : <EyeOff size={13} />}
+                  {showBackgroundImages ? "All visible" : "All hidden"}
+                </button>
+
+                <div className="space-y-2">
+                  {backgroundImages.map((bgImg, i) => (
+                    <div key={bgImg.id} className="border border-stone-200 rounded-lg p-2.5 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs mono-label text-stone-500">Image {i + 1}</span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setBackgroundImages((prev) => prev.map((im) => (im.id === bgImg.id ? { ...im, locked: !im.locked } : im)))}
+                            className={`p-1.5 rounded-full hover:bg-stone-100 ${bgImg.locked ? "text-emerald-700" : "text-stone-500"}`}
+                            title={bgImg.locked ? "Unlock to reposition this image" : "Lock this image in place to avoid nudging it by accident"}
+                          >
+                            {bgImg.locked ? <Lock size={13} /> : <Unlock size={13} />}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const img = new window.Image();
+                              img.onload = () =>
+                                setCalibrationSession({
+                                  dataUrl: bgImg.dataUrl,
+                                  naturalWidth: img.naturalWidth,
+                                  naturalHeight: img.naturalHeight,
+                                  points: [],
+                                  referenceFt: "",
+                                  existingImageId: bgImg.id,
+                                });
+                              img.src = bgImg.dataUrl;
+                            }}
+                            className="text-xs text-stone-500 hover:text-emerald-700 underline"
+                          >
+                            Recalibrate
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (window.confirm("Remove this image from your map?")) deleteBackgroundImage(bgImg.id);
+                            }}
+                            className="text-stone-400 hover:text-red-600 p-1 -m-1"
+                            title="Remove this image"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      </div>
+                      {bgImg.naturalWidth &&
+                        bgImg.naturalHeight &&
+                        (bgImg.widthPx > bgImg.naturalWidth * 1.15 || bgImg.heightPx > bgImg.naturalHeight * 1.15) && (
+                          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5">
+                            This image is stretched beyond its original resolution at its current size — some softness
+                            or blurriness here is a real limit of the source photo, not something the app can sharpen.
+                            A higher-resolution screenshot (zoom in more before capturing) will look crisper.
+                          </p>
+                        )}
+                      <div>
+                        <label className="text-xs mono-label text-stone-500 block mb-1">Opacity</label>
+                        <input
+                          type="range"
+                          min="0.1"
+                          max="1"
+                          step="0.05"
+                          value={bgImg.opacity}
+                          onChange={(e) =>
+                            setBackgroundImages((prev) =>
+                              prev.map((im) => (im.id === bgImg.id ? { ...im, opacity: Number(e.target.value) } : im))
+                            )
+                          }
+                          className="w-full"
+                        />
+                      </div>
+                    </div>
+                  ))}
                 </div>
                 <p className="text-xs text-stone-400">
-                  {backgroundImage.locked
-                    ? "Locked — the image won't move if you click near it while tracing beds. Unlock to reposition."
-                    : "Drag the image directly on the map to reposition it, then lock it in place when it's right."}
+                  Drag an unlocked image to reposition it. Blue side handles stretch just that one edge; violet
+                  corner handles resize width and height together but independently (a free diagonal drag); the
+                  small green handle scales the whole image proportionally. Lock it in place once it's right.
                 </p>
               </div>
             )}
@@ -3491,9 +3753,20 @@ export default function GardenPlanner() {
         </div>
 
         {/* Canvas */}
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 order-2">
           <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-            <h2 className="fraunces text-lg text-stone-700">Your land</h2>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowSidebar((s) => !s)}
+                className="flex items-center gap-1 text-xs px-2 py-1.5 rounded-lg border border-stone-300 hover:bg-stone-50 text-stone-600"
+                title={showSidebar ? "Hide the sidebar so Your land can use the full width" : "Show the sidebar again"}
+              >
+                <ChevronRight size={13} className={showSidebar ? "rotate-180" : ""} />
+                {showSidebar ? "Hide panel" : "Show panel"}
+              </button>
+              <h2 className="fraunces text-lg text-stone-700">Your land</h2>
+            </div>
             <div className="flex items-center gap-2">
               <span className="text-xs text-stone-400 mono-label hidden sm:inline">drag to reposition</span>
               <button
@@ -3546,18 +3819,58 @@ export default function GardenPlanner() {
                 </button>
               </div>
               <div
-                className="mono-label text-xs text-stone-500 border border-stone-300 rounded-lg px-2.5 py-1.5 bg-white"
-                title="Each square on the grid always represents this much real ground, no matter how far you zoom in or out"
+                className="flex items-center gap-1 mono-label text-xs text-stone-500 border border-stone-300 rounded-lg px-2 py-1 bg-white"
+                title="Square size adjusts the grid's scale directly, independent of zoom — zooming in or out doesn't change it once you've set it yourself"
               >
-                Square = {GRID_SQUARE_FT}ft
+                <span>Square =</span>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={activeGridFt}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (v > 0) setManualGridFt(v);
+                  }}
+                  className="w-12 border border-stone-300 rounded px-1 py-0.5 text-xs text-center focus:outline-none focus:ring-1 focus:ring-emerald-600"
+                />
+                <span>ft</span>
+                {manualGridFt !== null && (
+                  <button
+                    type="button"
+                    onClick={() => setManualGridFt(null)}
+                    className="ml-0.5 text-emerald-700 hover:text-emerald-900 underline"
+                    title="Go back to automatically adjusting the grid size as you zoom"
+                  >
+                    Auto
+                  </button>
+                )}
               </div>
             </div>
           </div>
+          <div className="relative" style={viewportWidth ? { width: viewportWidth } : undefined}>
           <div
             ref={canvasOuterRef}
             className="relative bg-stone-200 border border-stone-300 rounded-xl overflow-auto"
-            style={{ height: "82vh", minHeight: 520 }}
+            style={
+              viewportWidth
+                ? { width: viewportWidth, height: viewportHeight, minHeight: 300 }
+                : { height: "87vh", minHeight: 560 }
+            }
           >
+            {viewportWidth && (
+              <button
+                type="button"
+                onClick={() => {
+                  setViewportWidth(null);
+                  setViewportHeight(null);
+                }}
+                className="absolute top-2 right-2 z-40 text-xs bg-white border border-stone-300 rounded-lg px-2 py-1 text-stone-500 hover:text-stone-800 hover:bg-stone-50 shadow-sm"
+                title="Go back to the default responsive size"
+              >
+                Reset size
+              </button>
+            )}
             {canvasDraw && (
               <div className="sticky top-0 left-0 z-30 flex items-center justify-between gap-2 bg-white border-b border-stone-300 px-3 py-2 text-sm flex-wrap">
                 <span className="text-stone-600">
@@ -3593,7 +3906,7 @@ export default function GardenPlanner() {
                 style={{
                   width: contentWidth * zoom,
                   height: canvasHeight * zoom,
-                  backgroundSize: `${FT_TO_PX * GRID_SQUARE_FT * zoom}px ${FT_TO_PX * GRID_SQUARE_FT * zoom}px`,
+                  backgroundSize: `${FT_TO_PX * activeGridFt * zoom}px ${FT_TO_PX * activeGridFt * zoom}px`,
                 }}
               />
               <div
@@ -3601,25 +3914,113 @@ export default function GardenPlanner() {
                 className="absolute top-0 left-0"
                 style={{ width: contentWidth, minHeight: canvasHeight, touchAction: "none", transform: `scale(${zoom})`, transformOrigin: "top left" }}
               >
-            {backgroundImage && showBackgroundImage && (
-              <img
-                src={backgroundImage.dataUrl}
-                alt="Property reference"
-                draggable={false}
-                onMouseDown={backgroundImage.locked ? undefined : (e) => startDrag("image", "bg", e)}
-                onTouchStart={backgroundImage.locked ? undefined : (e) => startDrag("image", "bg", e)}
-                className={`absolute select-none ${backgroundImage.locked ? "pointer-events-none" : "cursor-grab active:cursor-grabbing"}`}
-                style={{
-                  left: backgroundImage.x,
-                  top: backgroundImage.y,
-                  width: backgroundImage.widthPx,
-                  height: backgroundImage.heightPx,
-                  opacity: backgroundImage.opacity,
-                }}
-              />
-            )}
-            {beds.length === 0 && plants.length === 0 && (
-              <div className="absolute inset-0 flex items-center justify-center text-stone-400 text-sm px-6 text-center">
+            {showBackgroundImages &&
+              backgroundImages.map((bgImg) => (
+                <div
+                  key={bgImg.id}
+                  className="absolute"
+                  style={{ left: bgImg.x, top: bgImg.y, width: bgImg.widthPx, height: bgImg.heightPx }}
+                >
+                  <img
+                    src={bgImg.dataUrl}
+                    alt="Property reference"
+                    draggable={false}
+                    onMouseDown={bgImg.locked ? undefined : (e) => startDrag("image", bgImg.id, e)}
+                    onTouchStart={bgImg.locked ? undefined : (e) => startDrag("image", bgImg.id, e)}
+                    className={`absolute inset-0 w-full h-full select-none ${bgImg.locked ? "pointer-events-none" : "cursor-grab active:cursor-grabbing"}`}
+                    style={{
+                      opacity: bgImg.opacity,
+                      WebkitUserDrag: "none",
+                      WebkitUserSelect: "none",
+                      MozUserSelect: "none",
+                      userSelect: "none",
+                    }}
+                  />
+                  {!bgImg.locked && (
+                    <>
+                      <div
+                        onMouseDown={(e) => startImageEdgeResize(bgImg.id, "right", e)}
+                        onTouchStart={(e) => startImageEdgeResize(bgImg.id, "right", e)}
+                        className="absolute bg-blue-600 border-2 border-white rounded-full shadow"
+                        style={{ right: -6, top: "50%", width: 12, height: 24, marginTop: -12, cursor: "ew-resize", transform: `scale(${1 / zoom})` }}
+                        title="Drag to stretch width (right edge only)"
+                      />
+                      <div
+                        onMouseDown={(e) => startImageEdgeResize(bgImg.id, "left", e)}
+                        onTouchStart={(e) => startImageEdgeResize(bgImg.id, "left", e)}
+                        className="absolute bg-blue-600 border-2 border-white rounded-full shadow"
+                        style={{ left: -6, top: "50%", width: 12, height: 24, marginTop: -12, cursor: "ew-resize", transform: `scale(${1 / zoom})` }}
+                        title="Drag to stretch width (left edge only)"
+                      />
+                      <div
+                        onMouseDown={(e) => startImageEdgeResize(bgImg.id, "bottom", e)}
+                        onTouchStart={(e) => startImageEdgeResize(bgImg.id, "bottom", e)}
+                        className="absolute bg-blue-600 border-2 border-white rounded-full shadow"
+                        style={{ bottom: -6, left: "50%", width: 24, height: 12, marginLeft: -12, cursor: "ns-resize", transform: `scale(${1 / zoom})` }}
+                        title="Drag to stretch height (bottom edge only)"
+                      />
+                      <div
+                        onMouseDown={(e) => startImageEdgeResize(bgImg.id, "top", e)}
+                        onTouchStart={(e) => startImageEdgeResize(bgImg.id, "top", e)}
+                        className="absolute bg-blue-600 border-2 border-white rounded-full shadow"
+                        style={{ top: -6, left: "50%", width: 24, height: 12, marginLeft: -12, cursor: "ns-resize", transform: `scale(${1 / zoom})` }}
+                        title="Drag to stretch height (top edge only)"
+                      />
+
+                      {/* Corner handles: resize width AND height independently at once (a true diagonal
+                          drag), unlike the single-axis edge handles above. */}
+                      <div
+                        onMouseDown={(e) => startImageEdgeResize(bgImg.id, "top-left", e)}
+                        onTouchStart={(e) => startImageEdgeResize(bgImg.id, "top-left", e)}
+                        className="absolute bg-violet-600 border-2 border-white rounded-full shadow"
+                        style={{ left: -6, top: -6, width: 13, height: 13, cursor: "nwse-resize", transform: `scale(${1 / zoom})` }}
+                        title="Drag diagonally to resize width and height together (independently, not locked to proportions)"
+                      />
+                      <div
+                        onMouseDown={(e) => startImageEdgeResize(bgImg.id, "top-right", e)}
+                        onTouchStart={(e) => startImageEdgeResize(bgImg.id, "top-right", e)}
+                        className="absolute bg-violet-600 border-2 border-white rounded-full shadow"
+                        style={{ right: -6, top: -6, width: 13, height: 13, cursor: "nesw-resize", transform: `scale(${1 / zoom})` }}
+                        title="Drag diagonally to resize width and height together (independently, not locked to proportions)"
+                      />
+                      <div
+                        onMouseDown={(e) => startImageEdgeResize(bgImg.id, "bottom-left", e)}
+                        onTouchStart={(e) => startImageEdgeResize(bgImg.id, "bottom-left", e)}
+                        className="absolute bg-violet-600 border-2 border-white rounded-full shadow"
+                        style={{ left: -6, bottom: -6, width: 13, height: 13, cursor: "nesw-resize", transform: `scale(${1 / zoom})` }}
+                        title="Drag diagonally to resize width and height together (independently, not locked to proportions)"
+                      />
+                      <div
+                        onMouseDown={(e) => startImageEdgeResize(bgImg.id, "bottom-right", e)}
+                        onTouchStart={(e) => startImageEdgeResize(bgImg.id, "bottom-right", e)}
+                        className="absolute bg-violet-600 border-2 border-white rounded-full shadow"
+                        style={{ right: -6, bottom: -6, width: 13, height: 13, cursor: "nwse-resize", transform: `scale(${1 / zoom})` }}
+                        title="Drag diagonally to resize width and height together (independently, not locked to proportions)"
+                      />
+
+                      {/* Proportional handle — sits just inside the corner (not on it) so it doesn't
+                          overlap the free-diagonal corner handle above. */}
+                      <div
+                        onMouseDown={(e) => startImageResize(bgImg.id, e)}
+                        onTouchStart={(e) => startImageResize(bgImg.id, e)}
+                        className="absolute bg-emerald-600 border-2 border-white rounded-full shadow"
+                        style={{
+                          right: 6,
+                          bottom: 6,
+                          width: 14,
+                          height: 14,
+                          cursor: "nwse-resize",
+                          transform: `scale(${1 / zoom})`,
+                          transformOrigin: "bottom right",
+                        }}
+                        title="Drag to resize (keeps the image's proportions)"
+                      />
+                    </>
+                  )}
+                </div>
+              ))}
+            {beds.length === 0 && plants.length === 0 && backgroundImages.length === 0 && (
+              <div className="absolute inset-0 flex items-center justify-center text-stone-400 text-sm px-6 text-center pointer-events-none">
                 Your map is empty. Add a bed or a freestanding plant on the left to get started.
               </div>
             )}
@@ -3683,6 +4084,7 @@ export default function GardenPlanner() {
                 startResizeDrag={startResizeDrag}
                 yearHistory={yearHistory}
                 clearBedHistory={clearBedHistory}
+                zoom={zoom}
               />
             ))}
 
@@ -3800,6 +4202,29 @@ export default function GardenPlanner() {
             )}
               </div>
             </div>
+          </div>
+          <div
+            onMouseDown={(e) => startViewportResize("right", e)}
+            onTouchStart={(e) => startViewportResize("right", e)}
+            className="absolute top-0 bottom-0 right-0 w-3 cursor-ew-resize hover:bg-emerald-600/25 rounded-r-xl z-10"
+            title="Drag anywhere along this edge to change just the width"
+          />
+          <div
+            onMouseDown={(e) => startViewportResize("bottom", e)}
+            onTouchStart={(e) => startViewportResize("bottom", e)}
+            className="absolute left-0 right-0 bottom-0 h-3 cursor-ns-resize hover:bg-emerald-600/25 rounded-b-xl z-10"
+            title="Drag anywhere along this edge to change just the height"
+          />
+          <div
+            onMouseDown={(e) => startViewportResize("corner", e)}
+            onTouchStart={(e) => startViewportResize("corner", e)}
+            className="absolute bottom-1 right-1 w-4 h-4 cursor-nwse-resize flex items-end justify-end z-20"
+            title="Drag to resize both width and height at once"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" className="text-stone-400">
+              <path d="M11 1L1 11M11 5.5L5.5 11M11 10L10 11" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" />
+            </svg>
+          </div>
           </div>
         </div>
       </div>

@@ -38,7 +38,7 @@
  *   GardenPlanner component, which owns essentially all app state and the top-level layout.
  */
 
-import { useState, useEffect, useRef, useCallback, useMemo, memo, Fragment } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, memo, Fragment } from "react";
 import {
   Trash2, Plus, X, ArrowUpRightFromCircle, Sprout, MapPin,
   PenTool, Undo2, Check, Edit3, Copy, ChevronDown, ChevronRight, Pencil,
@@ -3594,6 +3594,56 @@ export default function GardenPlanner() {
   const zoomIn = () => setZoom((z) => Math.min(ZOOM_MAX, Math.round(z * 1.25 * 1000) / 1000));
   const zoomOut = () => setZoom((z) => Math.max(ZOOM_MIN, Math.round((z / 1.25) * 1000) / 1000));
   const zoomReset = () => setZoom(1);
+
+  // Mouse-wheel zoom over "Your land", anchored on the cursor: the map point under the pointer
+  // stays under the pointer as the scale changes (like a map app), instead of zooming about the
+  // top-left corner. zoomRef mirrors the latest zoom so several wheel events fired before React
+  // re-renders keep compounding; wheelAnchorRef remembers the point to hold still until the new
+  // zoom has rendered (applied in the layout effect below, before paint, so there's no jump).
+  const zoomRef = useRef(1);
+  zoomRef.current = zoom;
+  const wheelAnchorRef = useRef(null); // { px, py: canvas coords under cursor; mx, my: cursor offset inside viewport; offX, offY: canvas origin inside scroll content }
+  useEffect(() => {
+    const el = canvasOuterRef.current;
+    if (!el) return undefined;
+    function onWheel(e) {
+      // Leave text fields alone (e.g. scrolling a select list or textarea inside the map).
+      const tag = e.target && e.target.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      e.preventDefault(); // React's onWheel is passive; a native non-passive listener is needed to stop page scroll
+      const lineScale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1; // normalise line/page wheels to pixels
+      const factor = Math.exp(-e.deltaY * lineScale * 0.0015); // smooth: ~12% per classic 100px notch, finer for trackpads
+      const oldZoom = zoomRef.current;
+      const newZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(oldZoom * factor * 1000) / 1000));
+      if (newZoom === oldZoom) return;
+      if (!wheelAnchorRef.current) {
+        const outer = el.getBoundingClientRect();
+        const canvas = canvasRef.current ? canvasRef.current.getBoundingClientRect() : outer;
+        wheelAnchorRef.current = {
+          px: (e.clientX - canvas.left) / oldZoom,
+          py: (e.clientY - canvas.top) / oldZoom,
+          mx: e.clientX - outer.left,
+          my: e.clientY - outer.top,
+          offX: canvas.left - outer.left + el.scrollLeft, // canvas origin within scrollable content (non-zero when the sticky draw toolbar is shown)
+          offY: canvas.top - outer.top + el.scrollTop,
+        };
+      }
+      zoomRef.current = newZoom;
+      setZoom(newZoom);
+    }
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]); // the viewport element is remounted when switching tabs, so re-attach
+  // After a wheel zoom renders, scroll so the anchored map point sits back under the cursor.
+  useLayoutEffect(() => {
+    const a = wheelAnchorRef.current;
+    const el = canvasOuterRef.current;
+    if (!a || !el) return;
+    wheelAnchorRef.current = null;
+    el.scrollLeft = a.offX + a.px * zoom - a.mx;
+    el.scrollTop = a.offY + a.py * zoom - a.my;
+  }, [zoom]);
   // Chooses the zoom that fits every bed, plant, light zone, feature and image in the visible viewport, then scrolls to the top-left of them.
   function zoomToFit() {
     const xs = [];
@@ -6029,7 +6079,7 @@ export default function GardenPlanner() {
                   setViewportWidth(null);
                   setViewportHeight(null);
                 }}
-                className="absolute top-2 right-2 z-40 text-xs bg-white border border-stone-300 rounded-lg px-2 py-1 text-stone-500 hover:text-stone-800 hover:bg-stone-50 shadow-sm"
+                className={`absolute ${canvasDraw ? "top-16" : "top-2"} right-2 z-40 text-xs bg-white border border-stone-300 rounded-lg px-2 py-1 text-stone-500 hover:text-stone-800 hover:bg-stone-50 shadow-sm`}
                 title="Go back to the default responsive size"
               >
                 Reset size

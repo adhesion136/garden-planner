@@ -355,3 +355,7 @@ I still can't reproduce the original issue myself (verified again with your exac
 - **Faster dragging:** dragging a bed with many plants went from ~95 ms to ~27 ms per mouse move (8 beds × 120 plants). Beds are now memoised (`MemoBedCard`) with stable handlers (`useStableHandlers`), fuzzy plant-name matching is cached, per-plant companion/rotation/light warnings are computed once per bed, and canvas sizing uses plain loops instead of `Math.max(...spread)`.
 - **Grid:** background grid is a single memoised SVG of `<line>` elements (capped at 4,000 lines). Verified to span the full map in Chromium with your exported data; still unconfirmed on your own Chrome — if it still cuts off, send your Chrome version and whether hardware acceleration is on.
 - **Comments:** doc comments on all constants/functions/components, inline notes on every state/ref, and `{/* … */}` section comments on the sidebar sections, map layers and tab router.
+
+## 2026-10-22 — Wheel zoom + draw-toolbar overlap fix
+- **Mouse-wheel zoom** over "Your land": scroll up to zoom in, down to zoom out, anchored on the cursor so the spot under the pointer stays put. Range matches the +/- buttons (3%–200%). Click-drag still pans.
+- **Reset size button** no longer sits on top of the Finish / Cancel / Undo toolbar while drawing or editing a shape.

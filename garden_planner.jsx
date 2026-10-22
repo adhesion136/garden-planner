@@ -555,6 +555,7 @@ const EVENT_TYPE_STYLES = {
   "Start indoors": "bg-purple-100 text-purple-800 border-purple-300",
   "Plant outside": "bg-emerald-100 text-emerald-800 border-emerald-300",
   Harvest: "bg-amber-100 text-amber-800 border-amber-300",
+  "Sow seeds": "bg-sky-100 text-sky-800 border-sky-300", // succession sowings from the Seeds tab
 };
 
 // Journal entry types (harvest, note, expense, ...) with their label and icon.
@@ -592,6 +593,7 @@ const LEGEND_ITEMS = [
   { label: "Start indoors", classes: "border-purple-300 bg-purple-100 text-purple-800" },
   { label: "Plant outside", classes: "border-emerald-300 bg-emerald-100 text-emerald-800" },
   { label: "Harvest", classes: "border-amber-300 bg-amber-100 text-amber-800" },
+  { label: "Sow seeds", classes: "border-sky-300 bg-sky-100 text-sky-800" },
 ];
 
 // Converts a month/day into a 0-51 week-of-year index, using a fixed non-leap reference year.
@@ -734,12 +736,42 @@ function GanttView({ beds, plants, categoryFilter }) {
   );
 }
 
+// Turns every seed packet with "Show on calendar" ticked into calendar events: one "Sow seeds" event
+// per succession sowing (marked once ticked off as sown) and, for crops started indoors, a
+// "Start indoors" event for each. Uses the same schedule the Seeds tab shows, for the shared plan year.
+function buildSeedCalendarEvents(seedPacks, zone, planYear) {
+  const events = [];
+  (seedPacks || []).forEach((pack) => {
+    const plan = pack.plan || {};
+    if (!plan.onCalendar) return;
+    const schedule = getSuccessionPlan({
+      crop: pack.crop,
+      zone,
+      year: planYear,
+      daysToMaturity: plan.daysToMaturity,
+      intervalWeeks: plan.intervalWeeks,
+      maxPlantings: plan.maxPlantings,
+      firstSowISO: plan.firstSowISO,
+    });
+    if (!schedule.rows) return; // unplannable (unknown crop, no zone ...) — the Seeds tab explains why
+    const sown = new Set(pack.sownDates || []);
+    const plantLike = { name: pack.crop, cultivar: pack.variety || "" }; // shaped like a plant so the calendar's existing rendering works
+    schedule.rows.forEach((r, i) => {
+      const where = `Seeds · sowing ${i + 1} of ${schedule.rows.length}`;
+      if (r.startIndoors) events.push({ plant: plantLike, locationLabel: where, type: "Start indoors", text: shortDate(r.startIndoors), sortDay: r.startIndoors.getDate(), count: 1 });
+      events.push({ plant: plantLike, locationLabel: where, type: "Sow seeds", text: shortDate(r.sow) + (sown.has(r.iso) ? " ✓ done" : ""), sortDay: r.sow.getDate(), count: 1 });
+    });
+  });
+  return events;
+}
+
 // The "Calendar" tab itself: toggles between a flat chronological List view (grouped by month,
 // using buildCalendarEvents) and the Gantt view above, with a shared category filter between them.
-function CalendarView({ beds, plants }) {
+function CalendarView({ beds, plants, seedPacks, zone, planYear }) {
   const [mode, setMode] = useState("list"); // view: "list" or "gantt"
   const [categoryFilter, setCategoryFilter] = useState(null); // event type to emphasize, or null for all
-  const events = buildCalendarEvents(beds, plants);
+  // Garden-plant events plus the sowing dates of every seed packet that has "Show on calendar" ticked.
+  const events = [...buildCalendarEvents(beds, plants), ...buildSeedCalendarEvents(seedPacks, zone, planYear)];
   const byMonth = Array.from({ length: 12 }, () => []);
   const unscheduled = [];
   events.forEach((ev) => {
@@ -814,7 +846,12 @@ function CalendarView({ beds, plants }) {
       ) : (
         <>
           {mode === "gantt" ? (
-            <GanttView beds={beds} plants={plants} categoryFilter={categoryFilter} />
+            <>
+              {seedPacks && seedPacks.some((p) => p.plan && p.plan.onCalendar) && (
+                <p className="text-xs text-stone-500 mb-2">Seed sowing dates show in the List view.</p>
+              )}
+              <GanttView beds={beds} plants={plants} categoryFilter={categoryFilter} />
+            </>
           ) : (
             <>
               {events.length > 0 && totalScheduled === 0 && (
@@ -1216,12 +1253,11 @@ function getSuccessionPlan({ crop, zone, year, daysToMaturity, intervalWeeks, ma
 }
 
 // The "Seeds" tab: seed inventory (add / edit / delete packets) plus a per-packet succession
-// planner. All state lives in GardenPlanner (seedPacks) and is saved with the rest of the garden;
-// this component only holds form inputs and which packet's plan is expanded.
-function SeedsView({ seedPacks, zone, plantNames, onAdd, onUpdate, onDelete }) {
+// planner. All state lives in GardenPlanner (seedPacks, plus planYear shared with the Calendar tab)
+// and is saved with the rest of the garden; this component only holds form inputs and which
+// packet's plan is expanded.
+function SeedsView({ seedPacks, zone, plantNames, planYear, setPlanYear, onAdd, onUpdate, onDelete }) {
   const thisYear = new Date().getFullYear();
-  // Planning year defaults to next year once late summer has passed (that's when you plan next season).
-  const [planYear, setPlanYear] = useState(new Date().getMonth() >= 8 ? thisYear + 1 : thisYear); // calendar year succession dates are computed for
   const [crop, setCrop] = useState(""); // new packet: crop name
   const [variety, setVariety] = useState(""); // new packet: variety
   const [supplier, setSupplier] = useState(""); // new packet: where it came from
@@ -1297,7 +1333,7 @@ function SeedsView({ seedPacks, zone, plantNames, onAdd, onUpdate, onDelete }) {
           <input type="number" min="1990" max="2100" value={packedFor} onChange={(e) => setPackedFor(e.target.value)} placeholder="Packed for year" title="The year printed on the packet" className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
           <input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Notes" className="col-span-2 sm:col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
           <button type="submit" className="col-span-2 sm:col-span-1 flex items-center justify-center gap-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-3 py-1.5 text-sm">
-            <Plus size={14} /> Add packet
+            <Plus size={14} /> Add seeds
           </button>
         </form>
       </section>
@@ -1336,6 +1372,36 @@ function SeedsView({ seedPacks, zone, plantNames, onAdd, onUpdate, onDelete }) {
 // the settings that shape the schedule, and the generated sowing table with "done" checkboxes.
 function SeedPackCard({ pack, zone, planYear, thisYear, open, onToggle, onUpdate, onDelete }) {
   const plan = pack.plan || {};
+  const [editing, setEditing] = useState(false); // true while the packet's details form is open
+  const [draft, setDraft] = useState(null); // working copy of the packet's editable fields while editing (strings, as typed)
+  // Opens the edit form pre-filled with this packet's current values.
+  const startEdit = () => {
+    setDraft({
+      crop: pack.crop,
+      variety: pack.variety || "",
+      supplier: pack.supplier || "",
+      quantity: pack.quantity == null ? "" : String(pack.quantity),
+      unit: pack.unit,
+      packedFor: pack.packedFor ? String(pack.packedFor) : "",
+      notes: pack.notes || "",
+    });
+    setEditing(true);
+  };
+  // Validates (crop is required) and saves the edited fields back to the packet.
+  const saveEdit = () => {
+    if (!draft.crop.trim()) return;
+    onUpdate(pack.id, {
+      crop: draft.crop.trim(),
+      variety: draft.variety.trim(),
+      supplier: draft.supplier.trim(),
+      quantity: draft.quantity === "" ? null : Math.max(0, Number(draft.quantity)),
+      unit: draft.unit,
+      packedFor: draft.packedFor ? Number(draft.packedFor) : null,
+      notes: draft.notes.trim(),
+    });
+    setEditing(false);
+  };
+  const setField = (k) => (e) => setDraft((d) => ({ ...d, [k]: e.target.value })); // onChange helper for the edit form's inputs
   // Recomputed only when the inputs that affect the schedule change.
   const schedule = useMemo(
     () =>
@@ -1374,6 +1440,30 @@ function SeedPackCard({ pack, zone, planYear, thisYear, open, onToggle, onUpdate
 
   return (
     <section className="bg-white border border-stone-300 rounded-xl p-4">
+      {editing && draft ? (
+        // Edit form: every field of the packet can be changed here
+        <div className="grid grid-cols-2 sm:grid-cols-6 gap-2">
+          <input value={draft.crop} onChange={setField("crop")} placeholder="Crop" list="seed-crop-options" className={`col-span-2 border rounded-lg px-2.5 py-1.5 text-sm ${draft.crop.trim() ? "border-stone-300" : "border-red-400 bg-red-50"}`} />
+          <input value={draft.variety} onChange={setField("variety")} placeholder="Variety" className="col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <input value={draft.supplier} onChange={setField("supplier")} placeholder="Supplier" className="col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <input type="number" min="0" value={draft.quantity} onChange={setField("quantity")} placeholder="Amount" className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <select value={draft.unit} onChange={setField("unit")} className="border border-stone-300 rounded-lg px-2 py-1.5 text-sm bg-white">
+            {SEED_UNITS.map((u) => (
+              <option key={u} value={u}>{u}</option>
+            ))}
+          </select>
+          <input type="number" min="1990" max="2100" value={draft.packedFor} onChange={setField("packedFor")} placeholder="Packed for year" title="The year printed on the packet" className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <input value={draft.notes} onChange={setField("notes")} placeholder="Notes" className="col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <div className="col-span-2 sm:col-span-1 flex items-center gap-1.5">
+            <button type="button" onClick={saveEdit} className="flex-1 flex items-center justify-center gap-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-3 py-1.5 text-sm">
+              <Check size={14} /> Save
+            </button>
+            <button type="button" onClick={() => setEditing(false)} className="border border-stone-300 rounded-lg px-3 py-1.5 text-sm hover:bg-stone-50">
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
       <div className="flex flex-wrap items-center gap-2 justify-between">
         <div className="min-w-0">
           <div className="font-medium text-stone-800">
@@ -1398,6 +1488,9 @@ function SeedPackCard({ pack, zone, planYear, thisYear, open, onToggle, onUpdate
             />
             {pack.unit}
           </label>
+          <button type="button" onClick={startEdit} className="text-xs border border-stone-300 rounded-lg px-2.5 py-1.5 hover:bg-stone-50 text-stone-600 flex items-center gap-1" title="Edit this packet's details">
+            <Pencil size={12} /> Edit
+          </button>
           <button type="button" onClick={onToggle} className="text-xs border border-stone-300 rounded-lg px-2.5 py-1.5 hover:bg-stone-50 text-emerald-700">
             {open ? "Hide plan" : "Succession plan"}
           </button>
@@ -1413,6 +1506,7 @@ function SeedPackCard({ pack, zone, planYear, thisYear, open, onToggle, onUpdate
           </button>
         </div>
       </div>
+      )}
 
       {open && (
         <div className="mt-3 pt-3 border-t border-stone-200 space-y-3">
@@ -1439,6 +1533,12 @@ function SeedPackCard({ pack, zone, planYear, thisYear, open, onToggle, onUpdate
               <input type="date" value={plan.firstSowISO ?? ""} onChange={(e) => setPlan({ firstSowISO: e.target.value })} className="border border-stone-300 rounded-lg px-2 py-1 text-sm text-stone-800" />
             </label>
           </div>
+
+          {/* Opt this packet's sowings into the Calendar tab */}
+          <label className="flex items-center gap-2 text-sm text-stone-600">
+            <input type="checkbox" checked={!!plan.onCalendar} onChange={(e) => setPlan({ onCalendar: e.target.checked })} />
+            Show these sowing dates on the Calendar tab
+          </label>
 
           {schedule && schedule.error ? (
             <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{schedule.error}</div>
@@ -3669,6 +3769,8 @@ export default function GardenPlanner() {
   const imageFileInputRef = useRef(null); // hidden <input type="file"> clicked programmatically to pick a background image
   const [yearHistory, setYearHistory] = useState([]); // archived past growing years (frozen snapshots)
   const [journalEntries, setJournalEntries] = useState([]); // harvest/notes/expense log entries
+  // Calendar year the succession plans are computed for (shared by the Seeds and Calendar tabs). Defaults to next year once September arrives — when next season gets planned. View-only, not saved.
+  const [seedPlanYear, setSeedPlanYear] = useState(new Date().getMonth() >= 8 ? new Date().getFullYear() + 1 : new Date().getFullYear());
   const [seedPacks, setSeedPacks] = useState([]); // seed inventory packets, each with its own succession-plan settings (saved + backed up, but not part of undo/redo)
   const [showYearRollover, setShowYearRollover] = useState(false); // whether the "start a new year" dialog is open
   const [zoneForm, setZoneForm] = useState({ sunExposure: "full_sun", customShape: null });
@@ -5937,7 +6039,7 @@ export default function GardenPlanner() {
 
       {/* Tab router: calendar / history / journal views, otherwise the main planner (sidebar + map) */}
       {activeTab === "calendar" ? (
-        <CalendarView beds={beds} plants={plants} />
+        <CalendarView beds={beds} plants={plants} seedPacks={seedPacks} zone={zone} planYear={seedPlanYear} />
       ) : activeTab === "history" ? (
         <HistoryView
           yearHistory={yearHistory}
@@ -5947,7 +6049,7 @@ export default function GardenPlanner() {
           onUpdatePlantNote={updateHistoryPlantNote}
         />
       ) : activeTab === "seeds" ? (
-        <SeedsView seedPacks={seedPacks} zone={zone} plantNames={seedCropOptions} onAdd={addSeedPack} onUpdate={updateSeedPack} onDelete={deleteSeedPack} />
+        <SeedsView seedPacks={seedPacks} zone={zone} plantNames={seedCropOptions} planYear={seedPlanYear} setPlanYear={setSeedPlanYear} onAdd={addSeedPack} onUpdate={updateSeedPack} onDelete={deleteSeedPack} />
       ) : activeTab === "journal" ? (
         <JournalView journalEntries={journalEntries} beds={beds} onAddEntry={addJournalEntry} onDeleteEntry={deleteJournalEntry} />
       ) : (

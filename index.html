@@ -2447,7 +2447,7 @@ body { font-family: 'Work Sans', sans-serif; }
 </style>
 <style id="extra-css">
 .col-span-2{grid-column:span 2/span 2}.gap-0\.5{gap:.125rem}.max-w-5xl{max-width:64rem}.p-8{padding:2rem}
-.text-amber-600{color:#d97706}.text-left{text-align:left}
+.text-amber-600{color:#d97706}.bg-sky-100{background-color:#e0f2fe}.border-sky-300{border-color:#7dd3fc}.text-sky-800{color:#075985}.line-through{text-decoration-line:line-through}.text-left{text-align:left}
 @media(min-width:640px){.sm\:col-span-1{grid-column:span 1/span 1}.sm\:col-span-2{grid-column:span 2/span 2}.sm\:grid-cols-5{grid-template-columns:repeat(5,minmax(0,1fr))}.sm\:grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}}
 </style></head>
 <body>
@@ -3768,7 +3768,8 @@ function getAllPlantEntries(beds, plants) {
 const EVENT_TYPE_STYLES = {
   "Start indoors": "bg-purple-100 text-purple-800 border-purple-300",
   "Plant outside": "bg-emerald-100 text-emerald-800 border-emerald-300",
-  Harvest: "bg-amber-100 text-amber-800 border-amber-300"
+  Harvest: "bg-amber-100 text-amber-800 border-amber-300",
+  "Sow seeds": "bg-sky-100 text-sky-800 border-sky-300" // succession sowings from the Seeds tab
 };
 
 // Journal entry types (harvest, note, expense, ...) with their label and icon.
@@ -3823,6 +3824,9 @@ const LEGEND_ITEMS = [{
 }, {
   label: "Harvest",
   classes: "border-amber-300 bg-amber-100 text-amber-800"
+}, {
+  label: "Sow seeds",
+  classes: "border-sky-300 bg-sky-100 text-sky-800"
 }];
 
 // Converts a month/day into a 0-51 week-of-year index, using a fixed non-leap reference year.
@@ -3963,15 +3967,65 @@ function GanttView({
   }, unscheduled.length, " kind", unscheduled.length === 1 ? "" : "s", " of plant with dates that didn't start with a recognizable month ", unscheduled.length === 1 ? "isn't" : "aren't", " shown on this timeline — see the List view for those."));
 }
 
+// Turns every seed packet with "Show on calendar" ticked into calendar events: one "Sow seeds" event
+// per succession sowing (marked once ticked off as sown) and, for crops started indoors, a
+// "Start indoors" event for each. Uses the same schedule the Seeds tab shows, for the shared plan year.
+function buildSeedCalendarEvents(seedPacks, zone, planYear) {
+  const events = [];
+  (seedPacks || []).forEach(pack => {
+    const plan = pack.plan || {};
+    if (!plan.onCalendar) return;
+    const schedule = getSuccessionPlan({
+      crop: pack.crop,
+      zone,
+      year: planYear,
+      daysToMaturity: plan.daysToMaturity,
+      intervalWeeks: plan.intervalWeeks,
+      maxPlantings: plan.maxPlantings,
+      firstSowISO: plan.firstSowISO
+    });
+    if (!schedule.rows) return; // unplannable (unknown crop, no zone ...) — the Seeds tab explains why
+    const sown = new Set(pack.sownDates || []);
+    const plantLike = {
+      name: pack.crop,
+      cultivar: pack.variety || ""
+    }; // shaped like a plant so the calendar's existing rendering works
+    schedule.rows.forEach((r, i) => {
+      const where = `Seeds · sowing ${i + 1} of ${schedule.rows.length}`;
+      if (r.startIndoors) events.push({
+        plant: plantLike,
+        locationLabel: where,
+        type: "Start indoors",
+        text: shortDate(r.startIndoors),
+        sortDay: r.startIndoors.getDate(),
+        count: 1
+      });
+      events.push({
+        plant: plantLike,
+        locationLabel: where,
+        type: "Sow seeds",
+        text: shortDate(r.sow) + (sown.has(r.iso) ? " ✓ done" : ""),
+        sortDay: r.sow.getDate(),
+        count: 1
+      });
+    });
+  });
+  return events;
+}
+
 // The "Calendar" tab itself: toggles between a flat chronological List view (grouped by month,
 // using buildCalendarEvents) and the Gantt view above, with a shared category filter between them.
 function CalendarView({
   beds,
-  plants
+  plants,
+  seedPacks,
+  zone,
+  planYear
 }) {
   const [mode, setMode] = useState("list"); // view: "list" or "gantt"
   const [categoryFilter, setCategoryFilter] = useState(null); // event type to emphasize, or null for all
-  const events = buildCalendarEvents(beds, plants);
+  // Garden-plant events plus the sowing dates of every seed packet that has "Show on calendar" ticked.
+  const events = [...buildCalendarEvents(beds, plants), ...buildSeedCalendarEvents(seedPacks, zone, planYear)];
   const byMonth = Array.from({
     length: 12
   }, () => []);
@@ -4016,11 +4070,13 @@ function CalendarView({
     className: `inline-flex items-center gap-1 border rounded-full px-2 py-0.5 transition ${item.classes} ${categoryFilter && categoryFilter !== item.label ? "opacity-40" : ""} ${categoryFilter === item.label ? "ring-2 ring-offset-1 ring-stone-400" : ""}`
   }, item.label))))), events.length === 0 && noInfoEntries.length === 0 ? /*#__PURE__*/React.createElement("div", {
     className: "bg-white border border-stone-300 rounded-xl p-6 text-center text-stone-400 text-sm"
-  }, "Nothing scheduled yet. Add planting or harvest dates on any plant's details (the ⓘ icon) to see it here.") : /*#__PURE__*/React.createElement(React.Fragment, null, mode === "gantt" ? /*#__PURE__*/React.createElement(GanttView, {
+  }, "Nothing scheduled yet. Add planting or harvest dates on any plant's details (the ⓘ icon) to see it here.") : /*#__PURE__*/React.createElement(React.Fragment, null, mode === "gantt" ? /*#__PURE__*/React.createElement(React.Fragment, null, seedPacks && seedPacks.some(p => p.plan && p.plan.onCalendar) && /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-500 mb-2"
+  }, "Seed sowing dates show in the List view."), /*#__PURE__*/React.createElement(GanttView, {
     beds: beds,
     plants: plants,
     categoryFilter: categoryFilter
-  }) : /*#__PURE__*/React.createElement(React.Fragment, null, events.length > 0 && totalScheduled === 0 && /*#__PURE__*/React.createElement("p", {
+  })) : /*#__PURE__*/React.createElement(React.Fragment, null, events.length > 0 && totalScheduled === 0 && /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-stone-500 mb-3"
   }, "None of your dates start with a recognizable month name yet — they're all in the \"Unscheduled\" list below."), /*#__PURE__*/React.createElement("div", {
     className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3"
@@ -4425,19 +4481,20 @@ function getSuccessionPlan({
 }
 
 // The "Seeds" tab: seed inventory (add / edit / delete packets) plus a per-packet succession
-// planner. All state lives in GardenPlanner (seedPacks) and is saved with the rest of the garden;
-// this component only holds form inputs and which packet's plan is expanded.
+// planner. All state lives in GardenPlanner (seedPacks, plus planYear shared with the Calendar tab)
+// and is saved with the rest of the garden; this component only holds form inputs and which
+// packet's plan is expanded.
 function SeedsView({
   seedPacks,
   zone,
   plantNames,
+  planYear,
+  setPlanYear,
   onAdd,
   onUpdate,
   onDelete
 }) {
   const thisYear = new Date().getFullYear();
-  // Planning year defaults to next year once late summer has passed (that's when you plan next season).
-  const [planYear, setPlanYear] = useState(new Date().getMonth() >= 8 ? thisYear + 1 : thisYear); // calendar year succession dates are computed for
   const [crop, setCrop] = useState(""); // new packet: crop name
   const [variety, setVariety] = useState(""); // new packet: variety
   const [supplier, setSupplier] = useState(""); // new packet: where it came from
@@ -4553,7 +4610,7 @@ function SeedsView({
     className: "col-span-2 sm:col-span-1 flex items-center justify-center gap-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-3 py-1.5 text-sm"
   }, /*#__PURE__*/React.createElement(Plus, {
     size: 14
-  }), " Add packet"))), /*#__PURE__*/React.createElement("div", {
+  }), " Add seeds"))), /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-2 text-sm text-stone-600"
   }, /*#__PURE__*/React.createElement("span", null, "Plan dates for"), /*#__PURE__*/React.createElement("input", {
     type: "number",
@@ -4592,6 +4649,39 @@ function SeedPackCard({
   onDelete
 }) {
   const plan = pack.plan || {};
+  const [editing, setEditing] = useState(false); // true while the packet's details form is open
+  const [draft, setDraft] = useState(null); // working copy of the packet's editable fields while editing (strings, as typed)
+  // Opens the edit form pre-filled with this packet's current values.
+  const startEdit = () => {
+    setDraft({
+      crop: pack.crop,
+      variety: pack.variety || "",
+      supplier: pack.supplier || "",
+      quantity: pack.quantity == null ? "" : String(pack.quantity),
+      unit: pack.unit,
+      packedFor: pack.packedFor ? String(pack.packedFor) : "",
+      notes: pack.notes || ""
+    });
+    setEditing(true);
+  };
+  // Validates (crop is required) and saves the edited fields back to the packet.
+  const saveEdit = () => {
+    if (!draft.crop.trim()) return;
+    onUpdate(pack.id, {
+      crop: draft.crop.trim(),
+      variety: draft.variety.trim(),
+      supplier: draft.supplier.trim(),
+      quantity: draft.quantity === "" ? null : Math.max(0, Number(draft.quantity)),
+      unit: draft.unit,
+      packedFor: draft.packedFor ? Number(draft.packedFor) : null,
+      notes: draft.notes.trim()
+    });
+    setEditing(false);
+  };
+  const setField = k => e => setDraft(d => ({
+    ...d,
+    [k]: e.target.value
+  })); // onChange helper for the edit form's inputs
   // Recomputed only when the inputs that affect the schedule change.
   const schedule = useMemo(() => open ? getSuccessionPlan({
     crop: pack.crop,
@@ -4628,7 +4718,68 @@ function SeedPackCard({
   };
   return /*#__PURE__*/React.createElement("section", {
     className: "bg-white border border-stone-300 rounded-xl p-4"
-  }, /*#__PURE__*/React.createElement("div", {
+  }, editing && draft ?
+  /*#__PURE__*/
+  // Edit form: every field of the packet can be changed here
+  React.createElement("div", {
+    className: "grid grid-cols-2 sm:grid-cols-6 gap-2"
+  }, /*#__PURE__*/React.createElement("input", {
+    value: draft.crop,
+    onChange: setField("crop"),
+    placeholder: "Crop",
+    list: "seed-crop-options",
+    className: `col-span-2 border rounded-lg px-2.5 py-1.5 text-sm ${draft.crop.trim() ? "border-stone-300" : "border-red-400 bg-red-50"}`
+  }), /*#__PURE__*/React.createElement("input", {
+    value: draft.variety,
+    onChange: setField("variety"),
+    placeholder: "Variety",
+    className: "col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm"
+  }), /*#__PURE__*/React.createElement("input", {
+    value: draft.supplier,
+    onChange: setField("supplier"),
+    placeholder: "Supplier",
+    className: "col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm"
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    min: "0",
+    value: draft.quantity,
+    onChange: setField("quantity"),
+    placeholder: "Amount",
+    className: "border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm"
+  }), /*#__PURE__*/React.createElement("select", {
+    value: draft.unit,
+    onChange: setField("unit"),
+    className: "border border-stone-300 rounded-lg px-2 py-1.5 text-sm bg-white"
+  }, SEED_UNITS.map(u => /*#__PURE__*/React.createElement("option", {
+    key: u,
+    value: u
+  }, u))), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    min: "1990",
+    max: "2100",
+    value: draft.packedFor,
+    onChange: setField("packedFor"),
+    placeholder: "Packed for year",
+    title: "The year printed on the packet",
+    className: "border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm"
+  }), /*#__PURE__*/React.createElement("input", {
+    value: draft.notes,
+    onChange: setField("notes"),
+    placeholder: "Notes",
+    className: "col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm"
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "col-span-2 sm:col-span-1 flex items-center gap-1.5"
+  }, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: saveEdit,
+    className: "flex-1 flex items-center justify-center gap-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-3 py-1.5 text-sm"
+  }, /*#__PURE__*/React.createElement(Check, {
+    size: 14
+  }), " Save"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: () => setEditing(false),
+    className: "border border-stone-300 rounded-lg px-3 py-1.5 text-sm hover:bg-stone-50"
+  }, "Cancel"))) : /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap items-center gap-2 justify-between"
   }, /*#__PURE__*/React.createElement("div", {
     className: "min-w-0"
@@ -4655,6 +4806,13 @@ function SeedPackCard({
     }),
     className: "w-20 border border-stone-300 rounded-lg px-2 py-1 text-sm"
   }), pack.unit), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: startEdit,
+    className: "text-xs border border-stone-300 rounded-lg px-2.5 py-1.5 hover:bg-stone-50 text-stone-600 flex items-center gap-1",
+    title: "Edit this packet's details"
+  }, /*#__PURE__*/React.createElement(Pencil, {
+    size: 12
+  }), " Edit"), /*#__PURE__*/React.createElement("button", {
     type: "button",
     onClick: onToggle,
     className: "text-xs border border-stone-300 rounded-lg px-2.5 py-1.5 hover:bg-stone-50 text-emerald-700"
@@ -4726,7 +4884,15 @@ function SeedPackCard({
       firstSowISO: e.target.value
     }),
     className: "border border-stone-300 rounded-lg px-2 py-1 text-sm text-stone-800"
-  }))), schedule && schedule.error ? /*#__PURE__*/React.createElement("div", {
+  }))), /*#__PURE__*/React.createElement("label", {
+    className: "flex items-center gap-2 text-sm text-stone-600"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: !!plan.onCalendar,
+    onChange: e => setPlan({
+      onCalendar: e.target.checked
+    })
+  }), "Show these sowing dates on the Calendar tab"), schedule && schedule.error ? /*#__PURE__*/React.createElement("div", {
     className: "text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2"
   }, schedule.error) : rowsThisYear.length === 0 ? /*#__PURE__*/React.createElement("div", {
     className: "text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2"
@@ -7050,6 +7216,8 @@ function GardenPlanner() {
   const imageFileInputRef = useRef(null); // hidden <input type="file"> clicked programmatically to pick a background image
   const [yearHistory, setYearHistory] = useState([]); // archived past growing years (frozen snapshots)
   const [journalEntries, setJournalEntries] = useState([]); // harvest/notes/expense log entries
+  // Calendar year the succession plans are computed for (shared by the Seeds and Calendar tabs). Defaults to next year once September arrives — when next season gets planned. View-only, not saved.
+  const [seedPlanYear, setSeedPlanYear] = useState(new Date().getMonth() >= 8 ? new Date().getFullYear() + 1 : new Date().getFullYear());
   const [seedPacks, setSeedPacks] = useState([]); // seed inventory packets, each with its own succession-plan settings (saved + backed up, but not part of undo/redo)
   const [showYearRollover, setShowYearRollover] = useState(false); // whether the "start a new year" dialog is open
   const [zoneForm, setZoneForm] = useState({
@@ -9686,7 +9854,10 @@ function GardenPlanner() {
     size: 15
   }), " Seeds")), activeTab === "calendar" ? /*#__PURE__*/React.createElement(CalendarView, {
     beds: beds,
-    plants: plants
+    plants: plants,
+    seedPacks: seedPacks,
+    zone: zone,
+    planYear: seedPlanYear
   }) : activeTab === "history" ? /*#__PURE__*/React.createElement(HistoryView, {
     yearHistory: yearHistory,
     onDeleteEntry: deleteYearHistoryEntry,
@@ -9697,6 +9868,8 @@ function GardenPlanner() {
     seedPacks: seedPacks,
     zone: zone,
     plantNames: seedCropOptions,
+    planYear: seedPlanYear,
+    setPlanYear: setSeedPlanYear,
     onAdd: addSeedPack,
     onUpdate: updateSeedPack,
     onDelete: deleteSeedPack

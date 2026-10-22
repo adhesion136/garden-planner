@@ -368,3 +368,8 @@ I still can't reproduce the original issue myself (verified again with your exac
 - Optional "used per sowing" amount → shows total needed vs. on hand, and what's left as you tick sowings off.
 - Saved with the rest of the garden and included in Backup & restore (backup format v7; older backups still import). Not part of undo/redo.
 - Plan year defaults to next year once September arrives; change it at the top of the tab.
+
+## 2026-10-22 — Seeds: edit packets + sowing dates on the Calendar
+- **Edit seeds:** each packet has an Edit button that opens every field (crop, variety, supplier, amount, unit, packed-for year, notes) with Save / Cancel. The on-hand amount can still be changed inline without opening the form. The "Add packet" button is now "Add seeds".
+- **Calendar:** tick "Show these sowing dates on the Calendar tab" in a packet's succession plan and its sowings appear in the Calendar's List view as blue "Sow seeds" events (plus "Start indoors" events for transplanted crops; done sowings are marked ✓). New "Sow seeds" filter chip in the legend. The Gantt view doesn't include seeds yet.
+- The plan year is now shared between the Seeds and Calendar tabs.

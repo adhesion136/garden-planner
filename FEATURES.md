@@ -359,3 +359,12 @@ I still can't reproduce the original issue myself (verified again with your exac
 ## 2026-10-22 — Wheel zoom + draw-toolbar overlap fix
 - **Mouse-wheel zoom** over "Your land": scroll up to zoom in, down to zoom out, anchored on the cursor so the spot under the pointer stays put. Range matches the +/- buttons (3%–200%). Click-drag still pans.
 - **Reset size button** no longer sits on top of the Finish / Cancel / Undo toolbar while drawing or editing a shape.
+
+## 2026-10-22 — Seed inventory + succession planting (new "Seeds" tab)
+- **Seed inventory:** add packets with crop, variety, supplier, amount + unit, and the "packed for" year. Edit the on-hand amount inline; delete with confirmation. Packets more than ~3 seasons old get an "older seed — test germination" note.
+- **Succession planner (per packet):** repeated sowings spaced a few weeks apart, computed from your zone's average frost dates and the crop's timing. First sowing = earliest outdoor date; last sowing = the latest date the crop can still mature before first fall frost (with grace for frost-tolerant crops). Each row shows start-indoors date (for transplants), sow/plant-out date and harvest window.
+- Defaults per crop (e.g. radish weekly, lettuce every 2 wks, carrot every 3) — override weeks between sowings, max sowings, days to maturity, or the first sowing date.
+- Cool-season crops (lettuce, spinach, cilantro, radish, pea) skip mid-summer sowings and resume for a fall crop.
+- Optional "used per sowing" amount → shows total needed vs. on hand, and what's left as you tick sowings off.
+- Saved with the rest of the garden and included in Backup & restore (backup format v7; older backups still import). Not part of undo/redo.
+- Plan year defaults to next year once September arrives; change it at the top of the tab.

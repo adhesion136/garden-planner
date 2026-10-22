@@ -1116,6 +1116,383 @@ function HistoryView({ yearHistory, onDeleteEntry, onUpdateYear, onUpdateYearNot
   );
 }
 
+// ─── Seed inventory & succession planting ────────────────────────────────────────────────────
+// A seed packet records what the user owns (crop, variety, supplier, quantity, the year it was
+// packed for). Optionally a packet carries a "succession plan": repeated sowings of the same crop
+// spaced a few weeks apart so the harvest is staggered instead of arriving all at once. Sowing
+// dates are computed from the user's zone's average frost dates plus the crop's reference
+// timing (PLANT_REFERENCE) — a rough starting point, like the rest of the planting calendar.
+
+// Units a seed quantity can be counted in.
+const SEED_UNITS = ["seeds", "packets", "grams", "oz"];
+
+// Typical weeks between repeat sowings, per PLANT_REFERENCE key. Fast crops that go by quickly
+// (radish) are sown often; slower ones less so. Anything not listed falls back to 3 weeks.
+const SUCCESSION_INTERVAL_WEEKS = {
+  radish: 1, lettuce: 2, spinach: 2, cilantro: 2, pea: 2, bean: 2, corn: 2,
+  carrot: 3, beet: 3, cucumber: 3, zucchini: 3, basil: 3, chard: 4, kale: 4,
+};
+
+// Cool-season crops that bolt or turn bitter in summer heat: succession sowings that would land in
+// the hot middle of the season are skipped, then sowing resumes in time for a fall crop.
+const COOL_SEASON_CROPS = new Set(["lettuce", "spinach", "cilantro", "radish", "pea"]);
+
+// Returns a new Date `n` days after `d` (negative n goes back); never mutates `d`.
+function addDays(d, n) {
+  const r = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  r.setDate(r.getDate() + n);
+  return r;
+}
+
+// Local-time "YYYY-MM-DD" for a Date (toISOString would shift the day for evening/UTC offsets).
+function toISODate(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// Parses "YYYY-MM-DD" into a local Date (null if it isn't one).
+function parseISODate(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || "");
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
+}
+
+// "Apr 12" style short date for display.
+function shortDate(d) {
+  return `${MONTH_NAMES[d.getMonth()]} ${d.getDate()}`;
+}
+
+// Builds the succession schedule for one crop. Inputs: the crop name, USDA zone, the calendar
+// year being planned, and optional overrides (days to maturity, weeks between sowings, a cap on
+// the number of sowings, a custom first-sowing date). Returns either { error } (can't plan —
+// unknown crop, perennial, zone unset ...) or { key, rows, dtm, interval, cutoff, first, coolSeason }
+// where each row is { iso, sow, harvestStart, harvestEnd, startIndoors|null }.
+//   - FIRST sowing: the crop's earliest outdoor date for the zone (same rule the planting calendar uses).
+//   - LAST sowing (cutoff): the latest day a crop can still mature — first fall frost for tender
+//     crops, plus a grace period for frost-tolerant ones (2 wks half-hardy, 4 wks hardy), minus
+//     days to maturity.
+function getSuccessionPlan({ crop, zone, year, daysToMaturity, intervalWeeks, maxPlantings, firstSowISO }) {
+  const key = matchPlantReference(crop);
+  if (!key) return { error: `No timing data for "${crop}" yet — pick a common crop name like lettuce, carrot or bean.` };
+  const ref = PLANT_REFERENCE[key];
+  if (ref.perennialNote) return { error: ref.perennialNote };
+  const frost = ZONE_FROST_DATES[parseInt(zone, 10)];
+  if (!frost) return { error: "Set your growing zone (in the Garden map tab) to get sowing dates." };
+  const dtm = Number(daysToMaturity) || ref.daysToMaturity;
+  if (!dtm) return { error: "No days-to-maturity known for this crop — enter it below." };
+
+  const lastFrost = new Date(year, frost.lastFrost[0], frost.lastFrost[1]);
+  const firstFrost = new Date(year, frost.firstFrost[0], frost.firstFrost[1]);
+
+  // Earliest outdoor date, as weeks relative to last frost (negative = before it).
+  let weeksFromLastFrost = null;
+  if (ref.transplantAfterWks != null) weeksFromLastFrost = ref.transplantAfterWks;
+  else if (ref.transplantBeforeWks != null) weeksFromLastFrost = -ref.transplantBeforeWks;
+  else if (ref.directSowBeforeWks != null) weeksFromLastFrost = -ref.directSowBeforeWks;
+  else if (ref.directSowAfterWks != null) weeksFromLastFrost = ref.directSowAfterWks;
+  if (weeksFromLastFrost == null) return { error: "No outdoor planting timing known for this crop." };
+
+  const first = parseISODate(firstSowISO) || addDays(lastFrost, weeksFromLastFrost * 7);
+  const grace = ref.tolerance === "hardy" ? 28 : ref.tolerance === "half_hardy" ? 14 : 0;
+  const cutoff = addDays(firstFrost, grace - dtm);
+  const interval = Math.max(1, Math.round(Number(intervalWeeks) || SUCCESSION_INTERVAL_WEEKS[key] || 3));
+  const cap = Math.max(1, Math.min(52, Math.round(Number(maxPlantings) || 24)));
+  const coolSeason = COOL_SEASON_CROPS.has(key);
+  // Heat gap for cool-season crops: from ~10 weeks after last frost until 3 weeks before the cutoff (fall crop).
+  const heatStart = addDays(lastFrost, 70);
+  const heatEnd = addDays(cutoff, -21);
+
+  const rows = [];
+  for (let d = first; d <= cutoff && rows.length < cap; d = addDays(d, interval * 7)) {
+    if (coolSeason && d >= heatStart && d < heatEnd) continue; // too hot — skip this one
+    rows.push({
+      iso: toISODate(d),
+      sow: d,
+      harvestStart: addDays(d, dtm),
+      harvestEnd: addDays(d, dtm + 14),
+      startIndoors: ref.startIndoorsWks ? addDays(d, -ref.startIndoorsWks * 7) : null,
+    });
+  }
+  return { key, rows, dtm, interval, cutoff, first, coolSeason };
+}
+
+// The "Seeds" tab: seed inventory (add / edit / delete packets) plus a per-packet succession
+// planner. All state lives in GardenPlanner (seedPacks) and is saved with the rest of the garden;
+// this component only holds form inputs and which packet's plan is expanded.
+function SeedsView({ seedPacks, zone, plantNames, onAdd, onUpdate, onDelete }) {
+  const thisYear = new Date().getFullYear();
+  // Planning year defaults to next year once late summer has passed (that's when you plan next season).
+  const [planYear, setPlanYear] = useState(new Date().getMonth() >= 8 ? thisYear + 1 : thisYear); // calendar year succession dates are computed for
+  const [crop, setCrop] = useState(""); // new packet: crop name
+  const [variety, setVariety] = useState(""); // new packet: variety
+  const [supplier, setSupplier] = useState(""); // new packet: where it came from
+  const [quantity, setQuantity] = useState(""); // new packet: amount on hand
+  const [unit, setUnit] = useState("seeds"); // new packet: unit for the quantity
+  const [packedFor, setPackedFor] = useState(String(thisYear)); // new packet: "packed for" year printed on the packet
+  const [notes, setNotes] = useState(""); // new packet: free-text notes
+  const [cropError, setCropError] = useState(false); // highlight the crop field when it's left empty
+  const [openId, setOpenId] = useState(null); // id of the packet whose succession plan is expanded
+
+  // Validates the add-packet form and hands a new packet to onAdd, then clears the form.
+  function handleAdd(e) {
+    e.preventDefault();
+    if (!crop.trim()) {
+      setCropError(true);
+      return;
+    }
+    onAdd({
+      id: `seed-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      crop: crop.trim(),
+      variety: variety.trim(),
+      supplier: supplier.trim(),
+      quantity: quantity === "" ? null : Math.max(0, Number(quantity)),
+      unit,
+      packedFor: packedFor ? Number(packedFor) : null,
+      notes: notes.trim(),
+      plan: { intervalWeeks: "", maxPlantings: "", perSowing: "", daysToMaturity: "", firstSowISO: "" }, // succession settings; blanks = use crop defaults
+      sownDates: [], // ISO dates of sowings already done
+    });
+    setCrop("");
+    setVariety("");
+    setSupplier("");
+    setQuantity("");
+    setNotes("");
+    setCropError(false);
+  }
+
+  const sorted = [...seedPacks].sort((a, b) => a.crop.localeCompare(b.crop) || (a.variety || "").localeCompare(b.variety || ""));
+
+  return (
+    <div className="max-w-5xl mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6 space-y-4">
+      {/* Add-a-packet form */}
+      <section className="bg-white border border-stone-300 rounded-xl p-4">
+        <h2 className="fraunces text-lg mb-3 flex items-center gap-2">
+          <Sprout size={18} className="text-emerald-700" /> Add seeds
+        </h2>
+        <form onSubmit={handleAdd} className="grid grid-cols-2 sm:grid-cols-6 gap-2">
+          <div className="col-span-2">
+            <input
+              list="seed-crop-options"
+              value={crop}
+              onChange={(e) => {
+                setCrop(e.target.value);
+                setCropError(false);
+              }}
+              placeholder="Crop (e.g. lettuce)"
+              className={`w-full border rounded-lg px-2.5 py-1.5 text-sm ${cropError ? "border-red-400 bg-red-50" : "border-stone-300"}`}
+            />
+            <datalist id="seed-crop-options">
+              {plantNames.map((n) => (
+                <option key={n} value={n} />
+              ))}
+            </datalist>
+          </div>
+          <input value={variety} onChange={(e) => setVariety(e.target.value)} placeholder="Variety" className="col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <input value={supplier} onChange={(e) => setSupplier(e.target.value)} placeholder="Supplier" className="col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <input type="number" min="0" value={quantity} onChange={(e) => setQuantity(e.target.value)} placeholder="Amount" className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <select value={unit} onChange={(e) => setUnit(e.target.value)} className="border border-stone-300 rounded-lg px-2 py-1.5 text-sm bg-white">
+            {SEED_UNITS.map((u) => (
+              <option key={u} value={u}>{u}</option>
+            ))}
+          </select>
+          <input type="number" min="1990" max="2100" value={packedFor} onChange={(e) => setPackedFor(e.target.value)} placeholder="Packed for year" title="The year printed on the packet" className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Notes" className="col-span-2 sm:col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <button type="submit" className="col-span-2 sm:col-span-1 flex items-center justify-center gap-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-3 py-1.5 text-sm">
+            <Plus size={14} /> Add packet
+          </button>
+        </form>
+      </section>
+
+      {/* Planning year selector (applies to every succession plan below) */}
+      <div className="flex items-center gap-2 text-sm text-stone-600">
+        <span>Plan dates for</span>
+        <input type="number" min="2000" max="2100" value={planYear} onChange={(e) => setPlanYear(Number(e.target.value) || thisYear)} className="w-20 border border-stone-300 rounded-lg px-2 py-1 text-sm" />
+        <span className="text-xs text-stone-400">Dates use average frost dates for your zone — treat them as a starting point.</span>
+      </div>
+
+      {sorted.length === 0 ? (
+        <div className="bg-white border border-dashed border-stone-300 rounded-xl p-8 text-center text-sm text-stone-400">
+          No seed packets yet. Add what you own above, then open a packet to plan staggered sowings.
+        </div>
+      ) : (
+        sorted.map((pack) => (
+          <SeedPackCard
+            key={pack.id}
+            pack={pack}
+            zone={zone}
+            planYear={planYear}
+            thisYear={thisYear}
+            open={openId === pack.id}
+            onToggle={() => setOpenId(openId === pack.id ? null : pack.id)}
+            onUpdate={onUpdate}
+            onDelete={onDelete}
+          />
+        ))
+      )}
+    </div>
+  );
+}
+
+// One seed packet: summary line, inline quantity edit, and (when expanded) its succession plan —
+// the settings that shape the schedule, and the generated sowing table with "done" checkboxes.
+function SeedPackCard({ pack, zone, planYear, thisYear, open, onToggle, onUpdate, onDelete }) {
+  const plan = pack.plan || {};
+  // Recomputed only when the inputs that affect the schedule change.
+  const schedule = useMemo(
+    () =>
+      open
+        ? getSuccessionPlan({
+            crop: pack.crop,
+            zone,
+            year: planYear,
+            daysToMaturity: plan.daysToMaturity,
+            intervalWeeks: plan.intervalWeeks,
+            maxPlantings: plan.maxPlantings,
+            firstSowISO: plan.firstSowISO,
+          })
+        : null,
+    [open, pack.crop, zone, planYear, plan.daysToMaturity, plan.intervalWeeks, plan.maxPlantings, plan.firstSowISO]
+  );
+
+  const sown = new Set(pack.sownDates || []);
+  const perSowing = Number(plan.perSowing) || 0;
+  const rowsThisYear = schedule && schedule.rows ? schedule.rows : [];
+  const sownCount = (pack.sownDates || []).length;
+  // Remaining stock = starting quantity minus what each recorded sowing used.
+  const remaining = pack.quantity == null ? null : Math.max(0, pack.quantity - perSowing * sownCount);
+  const needed = perSowing * rowsThisYear.length;
+  const old = pack.packedFor && pack.packedFor < thisYear - 2; // seed older than ~3 seasons loses viability
+
+  // Merges changes into this packet's plan settings.
+  const setPlan = (patch) => onUpdate(pack.id, { plan: { ...plan, ...patch } });
+  // Toggles whether a given sowing date has been done.
+  const toggleSown = (iso) => {
+    const next = new Set(sown);
+    if (next.has(iso)) next.delete(iso);
+    else next.add(iso);
+    onUpdate(pack.id, { sownDates: Array.from(next).sort() });
+  };
+
+  return (
+    <section className="bg-white border border-stone-300 rounded-xl p-4">
+      <div className="flex flex-wrap items-center gap-2 justify-between">
+        <div className="min-w-0">
+          <div className="font-medium text-stone-800">
+            {pack.crop}
+            {pack.variety ? <span className="text-stone-500 font-normal"> — {pack.variety}</span> : null}
+          </div>
+          <div className="text-xs text-stone-500 mt-0.5">
+            {[pack.supplier, pack.packedFor ? `packed for ${pack.packedFor}` : null].filter(Boolean).join(" · ")}
+            {old ? <span className="text-amber-600"> · older seed — test germination before relying on it</span> : null}
+          </div>
+          {pack.notes ? <div className="text-xs text-stone-400 mt-0.5">{pack.notes}</div> : null}
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="flex items-center gap-1 text-xs text-stone-500">
+            On hand
+            <input
+              type="number"
+              min="0"
+              value={pack.quantity == null ? "" : pack.quantity}
+              onChange={(e) => onUpdate(pack.id, { quantity: e.target.value === "" ? null : Math.max(0, Number(e.target.value)) })}
+              className="w-20 border border-stone-300 rounded-lg px-2 py-1 text-sm"
+            />
+            {pack.unit}
+          </label>
+          <button type="button" onClick={onToggle} className="text-xs border border-stone-300 rounded-lg px-2.5 py-1.5 hover:bg-stone-50 text-emerald-700">
+            {open ? "Hide plan" : "Succession plan"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (window.confirm(`Delete ${pack.crop}${pack.variety ? " — " + pack.variety : ""} from your seed inventory?`)) onDelete(pack.id);
+            }}
+            className="text-stone-400 hover:text-red-600 p-1"
+            title="Delete this packet"
+          >
+            <Trash2 size={15} />
+          </button>
+        </div>
+      </div>
+
+      {open && (
+        <div className="mt-3 pt-3 border-t border-stone-200 space-y-3">
+          {/* Settings that shape the schedule; blank fields fall back to the crop's defaults */}
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs text-stone-500">
+            <label className="flex flex-col gap-0.5">
+              Weeks between sowings
+              <input type="number" min="1" max="12" value={plan.intervalWeeks ?? ""} placeholder={schedule && schedule.interval ? String(schedule.interval) : "auto"} onChange={(e) => setPlan({ intervalWeeks: e.target.value })} className="border border-stone-300 rounded-lg px-2 py-1 text-sm text-stone-800" />
+            </label>
+            <label className="flex flex-col gap-0.5">
+              Max sowings
+              <input type="number" min="1" max="52" value={plan.maxPlantings ?? ""} placeholder="no cap" onChange={(e) => setPlan({ maxPlantings: e.target.value })} className="border border-stone-300 rounded-lg px-2 py-1 text-sm text-stone-800" />
+            </label>
+            <label className="flex flex-col gap-0.5">
+              Days to maturity
+              <input type="number" min="1" value={plan.daysToMaturity ?? ""} placeholder={schedule && schedule.dtm ? String(schedule.dtm) : "auto"} onChange={(e) => setPlan({ daysToMaturity: e.target.value })} className="border border-stone-300 rounded-lg px-2 py-1 text-sm text-stone-800" />
+            </label>
+            <label className="flex flex-col gap-0.5">
+              {pack.unit} used per sowing
+              <input type="number" min="0" value={plan.perSowing ?? ""} placeholder="optional" onChange={(e) => setPlan({ perSowing: e.target.value })} className="border border-stone-300 rounded-lg px-2 py-1 text-sm text-stone-800" />
+            </label>
+            <label className="flex flex-col gap-0.5">
+              First sowing date
+              <input type="date" value={plan.firstSowISO ?? ""} onChange={(e) => setPlan({ firstSowISO: e.target.value })} className="border border-stone-300 rounded-lg px-2 py-1 text-sm text-stone-800" />
+            </label>
+          </div>
+
+          {schedule && schedule.error ? (
+            <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{schedule.error}</div>
+          ) : rowsThisYear.length === 0 ? (
+            <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+              No sowing dates fit before the first fall frost with these settings — try a shorter days-to-maturity or an earlier first sowing date.
+            </div>
+          ) : (
+            <>
+              <div className="text-xs text-stone-500">
+                {rowsThisYear.length} sowing{rowsThisYear.length === 1 ? "" : "s"} every {schedule.interval} week{schedule.interval === 1 ? "" : "s"}, last sowing by {shortDate(schedule.cutoff)}
+                {schedule.coolSeason ? " — mid-summer sowings skipped (too hot for this crop), with a fall crop at the end" : ""}.
+                {perSowing > 0 && pack.quantity != null ? (
+                  <span className={needed > pack.quantity ? " text-red-600" : " text-emerald-700"}>
+                    {" "}Needs {needed} {pack.unit} total; you have {pack.quantity}
+                    {needed > pack.quantity ? ` — short by ${needed - pack.quantity}.` : "."}
+                  </span>
+                ) : null}
+                {remaining != null && perSowing > 0 && sownCount > 0 ? ` ${remaining} ${pack.unit} left after ${sownCount} sown.` : ""}
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs text-stone-400">
+                      <th className="py-1 pr-2 font-normal">Done</th>
+                      <th className="py-1 pr-2 font-normal">#</th>
+                      <th className="py-1 pr-2 font-normal">Start indoors</th>
+                      <th className="py-1 pr-2 font-normal">Sow / plant out</th>
+                      <th className="py-1 font-normal">Harvest window</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rowsThisYear.map((r, i) => (
+                      <tr key={r.iso} className={sown.has(r.iso) ? "text-stone-400 line-through" : "text-stone-700"}>
+                        <td className="py-1 pr-2">
+                          <input type="checkbox" checked={sown.has(r.iso)} onChange={() => toggleSown(r.iso)} />
+                        </td>
+                        <td className="py-1 pr-2">{i + 1}</td>
+                        <td className="py-1 pr-2">{r.startIndoors ? shortDate(r.startIndoors) : "—"}</td>
+                        <td className="py-1 pr-2">{shortDate(r.sow)}</td>
+                        <td className="py-1">{shortDate(r.harvestStart)} – {shortDate(r.harvestEnd)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 // The "Journal" tab: free-form dated entries (harvest, pest/disease, expense, general note),
 // each optionally tagged to a bed — independent of any plant, calendar, or history data; this is
 // just a simple running log the user writes and reads back chronologically.
@@ -3292,6 +3669,7 @@ export default function GardenPlanner() {
   const imageFileInputRef = useRef(null); // hidden <input type="file"> clicked programmatically to pick a background image
   const [yearHistory, setYearHistory] = useState([]); // archived past growing years (frozen snapshots)
   const [journalEntries, setJournalEntries] = useState([]); // harvest/notes/expense log entries
+  const [seedPacks, setSeedPacks] = useState([]); // seed inventory packets, each with its own succession-plan settings (saved + backed up, but not part of undo/redo)
   const [showYearRollover, setShowYearRollover] = useState(false); // whether the "start a new year" dialog is open
   const [zoneForm, setZoneForm] = useState({ sunExposure: "full_sun", customShape: null });
   const [featureForm, setFeatureForm] = useState({ name: "", kind: "path", notes: "" }); // sidebar form values for a new landscape feature
@@ -3300,7 +3678,7 @@ export default function GardenPlanner() {
   const [bedForm, setBedForm] = useState(blankFormValues()); // sidebar "Add a bed" form values
   const [bedNameError, setBedNameError] = useState(false); // show the "bed name required" message
   const [legendOpen, setLegendOpen] = useState(false); // whether the Gantt legend is expanded
-  const [activeTab, setActiveTab] = useState("map"); // current tab: "map" | "calendar" | "history" | "journal"
+  const [activeTab, setActiveTab] = useState("map"); // current tab: "map" | "calendar" | "history" | "journal" | "seeds"
   const [zoom, setZoom] = useState(1); // map zoom factor (1 = 100%); view-only, not saved or undoable
   const [baseWidth, setBaseWidth] = useState(800); // measured width of the map viewport in px (updated by a ResizeObserver)
   const [baseHeight, setBaseHeight] = useState(400); // measured height of the map viewport in px
@@ -3354,6 +3732,7 @@ export default function GardenPlanner() {
           setSiteFeatures(data.siteFeatures || []);
           setYearHistory(data.yearHistory || []);
           setJournalEntries(data.journalEntries || []);
+          setSeedPacks(Array.isArray(data.seedPacks) ? data.seedPacks : []);
           setBackgroundImages(migrateBackgroundImages(data));
         }
       } catch (e) {
@@ -3368,7 +3747,7 @@ export default function GardenPlanner() {
   // write fails (almost always a storage-quota issue caused by large images), so a garden's
   // actual data never gets lost just because an image didn't fit.
   const persist = useCallback(
-    async (nextBeds, nextPlants, nextZone, nextZoneCustomText, nextLightZones, nextSiteFeatures, nextYearHistory, nextJournalEntries, nextBackgroundImages) => {
+    async (nextBeds, nextPlants, nextZone, nextZoneCustomText, nextLightZones, nextSiteFeatures, nextYearHistory, nextJournalEntries, nextBackgroundImages, nextSeedPacks) => {
       const basePayload = {
         beds: nextBeds,
         plants: nextPlants,
@@ -3378,6 +3757,7 @@ export default function GardenPlanner() {
         siteFeatures: nextSiteFeatures,
         yearHistory: nextYearHistory,
         journalEntries: nextJournalEntries,
+        seedPacks: nextSeedPacks || [],
       };
       try {
         await window.storage.set(STORAGE_KEY, JSON.stringify({ ...basePayload, backgroundImages: nextBackgroundImages }));
@@ -3516,8 +3896,8 @@ export default function GardenPlanner() {
   // (just an object assignment, no serialization) on every relevant change.
   const latestSaveDataRef = useRef(null);
   useEffect(() => {
-    latestSaveDataRef.current = { beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages };
-  }, [beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages]);
+    latestSaveDataRef.current = { beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks };
+  }, [beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks]);
 
   // Debounced so a fast-changing drag (a bed, plant, or image moving through dozens of positions a
   // second) doesn't trigger a full JSON.stringify-and-write on every single intermediate step — only
@@ -3529,12 +3909,12 @@ export default function GardenPlanner() {
     if (!loaded) return;
     persistTimeoutRef.current = setTimeout(() => {
       persistTimeoutRef.current = null;
-      persist(beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages);
+      persist(beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks);
     }, 500);
     return () => {
       if (persistTimeoutRef.current) clearTimeout(persistTimeoutRef.current);
     };
-  }, [beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, loaded, persist]);
+  }, [beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks, loaded, persist]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -3543,7 +3923,7 @@ export default function GardenPlanner() {
       clearTimeout(persistTimeoutRef.current);
       persistTimeoutRef.current = null;
       const d = latestSaveDataRef.current;
-      if (d) persist(d.beds, d.plants, d.zone, d.zoneCustomText, d.lightZones, d.siteFeatures, d.yearHistory, d.journalEntries, d.backgroundImages);
+      if (d) persist(d.beds, d.plants, d.zone, d.zoneCustomText, d.lightZones, d.siteFeatures, d.yearHistory, d.journalEntries, d.backgroundImages, d.seedPacks);
     };
     const onVisibilityChange = () => {
       if (document.hidden) flushIfPending();
@@ -3594,6 +3974,13 @@ export default function GardenPlanner() {
   const zoomIn = () => setZoom((z) => Math.min(ZOOM_MAX, Math.round(z * 1.25 * 1000) / 1000));
   const zoomOut = () => setZoom((z) => Math.max(ZOOM_MIN, Math.round((z / 1.25) * 1000) / 1000));
   const zoomReset = () => setZoom(1);
+
+  // Seed inventory handlers (used by the Seeds tab). Packets are plain objects in seedPacks; updates merge a patch by id.
+  const addSeedPack = (pack) => setSeedPacks((list) => [...list, pack]);
+  const updateSeedPack = (id, patch) => setSeedPacks((list) => list.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  const deleteSeedPack = (id) => setSeedPacks((list) => list.filter((p) => p.id !== id));
+  // Crop names offered as suggestions when adding seeds: every crop with planting timing data, capitalised.
+  const seedCropOptions = useMemo(() => Object.keys(PLANT_REFERENCE).map((k) => k.charAt(0).toUpperCase() + k.slice(1)), []);
 
   // Mouse-wheel zoom over "Your land", anchored on the cursor: the map point under the pointer
   // stays under the pointer as the scale changes (like a map app), instead of zooming about the
@@ -3953,7 +4340,7 @@ export default function GardenPlanner() {
     const payload = {
       exportedAt: new Date().toISOString(),
       app: "Homestead Bed Planner",
-      version: 6,
+      version: 7,
       beds,
       plants,
       zone,
@@ -3962,6 +4349,7 @@ export default function GardenPlanner() {
       siteFeatures,
       yearHistory,
       journalEntries,
+      seedPacks,
       backgroundImages,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -4009,6 +4397,7 @@ export default function GardenPlanner() {
         setSiteFeatures(Array.isArray(data.siteFeatures) ? data.siteFeatures : []);
         setYearHistory(Array.isArray(data.yearHistory) ? data.yearHistory : []);
         setJournalEntries(Array.isArray(data.journalEntries) ? data.journalEntries : []);
+        setSeedPacks(Array.isArray(data.seedPacks) ? data.seedPacks : []);
         setBackgroundImages(migrateBackgroundImages(data));
         setImportError("");
       } catch (err) {
@@ -5535,6 +5924,15 @@ export default function GardenPlanner() {
         >
           <BookOpen size={15} /> Journal
         </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab("seeds")}
+          className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-t-lg border border-b-0 -mb-px ${
+            activeTab === "seeds" ? "bg-white border-stone-300 text-emerald-700" : "bg-transparent border-transparent text-stone-500 hover:text-stone-700"
+          }`}
+        >
+          <Sprout size={15} /> Seeds
+        </button>
       </div>
 
       {/* Tab router: calendar / history / journal views, otherwise the main planner (sidebar + map) */}
@@ -5548,6 +5946,8 @@ export default function GardenPlanner() {
           onUpdateYearNotes={updateYearNotes}
           onUpdatePlantNote={updateHistoryPlantNote}
         />
+      ) : activeTab === "seeds" ? (
+        <SeedsView seedPacks={seedPacks} zone={zone} plantNames={seedCropOptions} onAdd={addSeedPack} onUpdate={updateSeedPack} onDelete={deleteSeedPack} />
       ) : activeTab === "journal" ? (
         <JournalView journalEntries={journalEntries} beds={beds} onAddEntry={addJournalEntry} onDeleteEntry={deleteJournalEntry} />
       ) : (

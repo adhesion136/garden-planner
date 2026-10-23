@@ -43,7 +43,7 @@ import {
   Trash2, Plus, X, ArrowUpRightFromCircle, Sprout, MapPin,
   PenTool, Undo2, Check, Edit3, Copy, ChevronDown, ChevronRight, Pencil,
   ZoomIn, ZoomOut, Download, Upload, Info, AlertTriangle, Sun, CalendarDays, Map, History, Eye, EyeOff, BookOpen,
-  Image as ImageIcon, Lock, Unlock,
+  Image as ImageIcon, Lock, Unlock, Package,
 } from "lucide-react";
 
 // Key under which the whole garden (beds, plants, zone, light zones, history, journal, images) is saved in storage.
@@ -1593,15 +1593,668 @@ function SeedPackCard({ pack, zone, planYear, thisYear, open, onToggle, onUpdate
   );
 }
 
+// ─── Harvest totals ──────────────────────────────────────────────────────────────────────────
+// Harvest journal entries can carry a structured amount (quantity + unit) so they can be added up.
+// Older harvest entries that only have free text ("3 lbs tomatoes") have no quantity; they stay in
+// the journal but aren't counted in totals.
+
+// Units a harvest can be measured in, with the "family" each belongs to. Units within a family are
+// converted and summed together (oz into lb, g into kg, pints/quarts into gallons); different
+// families are never mixed, since 5 lb and 12 "count" can't be added — they're shown side by side.
+const HARVEST_UNITS = {
+  lb: { family: "lb", factor: 1 },
+  oz: { family: "lb", factor: 1 / 16 },
+  kg: { family: "kg", factor: 1 },
+  g: { family: "kg", factor: 1 / 1000 },
+  count: { family: "count", factor: 1 },
+  bunch: { family: "bunch", factor: 1 },
+  gallon: { family: "gallon", factor: 1 },
+  quart: { family: "gallon", factor: 1 / 4 },
+  pint: { family: "gallon", factor: 1 / 8 },
+};
+
+// Rounds to at most 2 decimals and drops trailing zeros, so totals read "12.5", not "12.50" or 12.499999.
+function fmtAmount(n) {
+  return String(Math.round(n * 100) / 100);
+}
+
+// Adds up harvest entries. Only harvest entries with a numeric quantity count; `year` (a number, or
+// null for all years) filters by the entry date's year; `groupBy` is "plant" or "bed". Returns
+// { groups, overall, uncounted } where each group is { label, entries, totals: {family: amount} },
+// sorted by label, `overall` is the same family totals across everything, and `uncounted` is how
+// many harvest entries (in that year) had no quantity.
+function summarizeHarvests(journalEntries, groupBy, year) {
+  const groups = new Map(); // lowercase group name -> { label, entries, totals }
+  const overall = {};
+  let uncounted = 0;
+  for (const e of journalEntries) {
+    if (e.type !== "harvest") continue;
+    if (year != null && Number((e.date || "").slice(0, 4)) !== year) continue;
+    const q = Number(e.quantity);
+    const unit = HARVEST_UNITS[e.unit];
+    if (!(q > 0) || !unit) {
+      uncounted += 1;
+      continue;
+    }
+    const raw = (groupBy === "bed" ? e.bedName : e.plantName) || "";
+    const label = raw.trim() || (groupBy === "bed" ? "No bed" : "Unspecified plant");
+    const key = label.toLowerCase();
+    let g = groups.get(key);
+    if (!g) {
+      g = { label, entries: 0, totals: {} };
+      groups.set(key, g);
+    }
+    const base = q * unit.factor;
+    g.entries += 1;
+    g.totals[unit.family] = (g.totals[unit.family] || 0) + base;
+    overall[unit.family] = (overall[unit.family] || 0) + base;
+  }
+  return { groups: Array.from(groups.values()).sort((a, b) => a.label.localeCompare(b.label)), overall, uncounted };
+}
+
+// Renders a { family: amount } totals object as "12.5 lb · 40 count" (families in a stable order).
+function formatTotals(totals) {
+  const order = ["lb", "kg", "count", "bunch", "gallon"];
+  const parts = order.filter((f) => totals[f]).map((f) => `${fmtAmount(totals[f])} ${f}`);
+  return parts.length ? parts.join(" · ") : "—";
+}
+
+// The "Harvest totals" panel at the top of the Journal tab: pick a year (or all years) and group by
+// plant or by bed to see how much came in. Hidden until at least one harvest has an amount.
+function HarvestTotals({ journalEntries }) {
+  const [groupBy, setGroupBy] = useState("plant"); // "plant" | "bed" — what the rows are grouped by
+  const [yearChoice, setYearChoice] = useState("latest"); // "latest" (newest year with harvests), "all", or a year as text
+
+  // Years that have at least one harvest entry, newest first.
+  const years = useMemo(() => {
+    const set = new Set();
+    journalEntries.forEach((e) => {
+      if (e.type === "harvest" && e.date) set.add(Number(e.date.slice(0, 4)));
+    });
+    return Array.from(set).filter(Boolean).sort((a, b) => b - a);
+  }, [journalEntries]);
+
+  const year = yearChoice === "all" ? null : yearChoice === "latest" ? years[0] ?? null : Number(yearChoice);
+  const { groups, overall, uncounted } = useMemo(() => summarizeHarvests(journalEntries, groupBy, year), [journalEntries, groupBy, year]);
+
+  if (groups.length === 0 && uncounted === 0) return null;
+
+  return (
+    <div className="bg-white border border-stone-300 rounded-xl p-4 mb-4">
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <h3 className="fraunces text-base text-stone-700">Harvest totals</h3>
+        <div className="flex items-center gap-2 text-xs">
+          <select
+            value={yearChoice === "latest" && year != null ? String(year) : yearChoice}
+            onChange={(e) => setYearChoice(e.target.value)}
+            className="border border-stone-300 rounded-lg px-2 py-1 bg-white"
+          >
+            <option value="all">All years</option>
+            {years.map((y) => (
+              <option key={y} value={String(y)}>{y}</option>
+            ))}
+          </select>
+          <div className="flex border border-stone-300 rounded-lg overflow-hidden">
+            {["plant", "bed"].map((g) => (
+              <button
+                key={g}
+                type="button"
+                onClick={() => setGroupBy(g)}
+                className={`px-2.5 py-1 ${groupBy === g ? "bg-emerald-700 text-white" : "bg-white text-stone-600 hover:bg-stone-50"} ${g === "bed" ? "border-l border-stone-300" : ""}`}
+              >
+                By {g}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {groups.length === 0 ? (
+        <p className="text-sm text-stone-400">No harvests with an amount logged{year != null ? ` in ${year}` : ""} yet.</p>
+      ) : (
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-stone-400">
+              <th className="py-1 pr-2 font-normal">{groupBy === "bed" ? "Bed" : "Plant"}</th>
+              <th className="py-1 pr-2 font-normal">Total</th>
+              <th className="py-1 font-normal text-right">Harvests</th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map((g) => (
+              <tr key={g.label} className="border-t border-stone-100 text-stone-700">
+                <td className="py-1 pr-2">{g.label}</td>
+                <td className="py-1 pr-2">{formatTotals(g.totals)}</td>
+                <td className="py-1 text-right text-stone-400">{g.entries}</td>
+              </tr>
+            ))}
+            <tr className="border-t border-stone-300 font-medium text-stone-800">
+              <td className="py-1 pr-2">{year != null ? `All ${year}` : "All years"}</td>
+              <td className="py-1 pr-2">{formatTotals(overall)}</td>
+              <td className="py-1" />
+            </tr>
+          </tbody>
+        </table>
+      )}
+      {uncounted > 0 && (
+        <p className="text-xs text-stone-400 mt-2">
+          {uncounted} harvest entr{uncounted === 1 ? "y has" : "ies have"} no amount, so {uncounted === 1 ? "it isn't" : "they aren't"} counted. New harvest entries ask for an amount and unit.
+        </p>
+      )}
+    </div>
+  );
+}
+
+// One journal entry in the Journal tab's list: the normal read-only card, or (after clicking Edit)
+// an inline form for changing any of its fields — type, date, bed, plant, harvest amount/unit,
+// expense amount, notes. Editing also lets older free-text harvests be given a countable amount.
+function JournalEntryRow({ entry, bedNameOptions, onSave, onDelete }) {
+  const [editing, setEditing] = useState(false); // true while the inline edit form is open
+  const [draft, setDraft] = useState(null); // working copy of the entry's editable fields while editing (strings, as typed)
+  const t = JOURNAL_TYPES[entry.type] || JOURNAL_TYPES.note;
+
+  // Opens the form pre-filled with the entry's current values.
+  const startEdit = () => {
+    setDraft({
+      type: entry.type,
+      date: entry.date || "",
+      bedName: entry.bedName || "",
+      plantName: entry.plantName || "",
+      amount: entry.amount || "",
+      quantity: entry.quantity > 0 ? String(entry.quantity) : "",
+      unit: entry.unit && HARVEST_UNITS[entry.unit] ? entry.unit : "lb",
+      notes: entry.notes || "",
+    });
+    setEditing(true);
+  };
+  // Saves the edited fields, normalising them the same way the Add form does; a date is required.
+  const save = () => {
+    if (!draft.date) return;
+    const isHarvest = draft.type === "harvest";
+    const hasQty = isHarvest && Number(draft.quantity) > 0;
+    onSave(entry.id, {
+      type: draft.type,
+      date: draft.date,
+      bedName: draft.bedName.trim(),
+      plantName: draft.plantName.trim(),
+      amount: draft.type === "expense" ? draft.amount : "",
+      quantity: hasQty ? Number(draft.quantity) : null,
+      unit: hasQty ? draft.unit : null,
+      notes: draft.notes.trim(),
+    });
+    setEditing(false);
+  };
+  const setField = (k) => (e) => setDraft((d) => ({ ...d, [k]: e.target.value })); // onChange helper for the form's inputs
+  const input = "w-full border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600";
+
+  if (editing && draft) {
+    return (
+      <div className="bg-white border border-emerald-400 rounded-xl p-3 space-y-2">
+        <div className="flex flex-wrap gap-2">
+          {Object.entries(JOURNAL_TYPES).map(([key, jt]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setDraft((d) => ({ ...d, type: key }))}
+              className={`text-xs px-3 py-1 rounded-full border font-medium ${draft.type === key ? jt.badge + " ring-2 ring-offset-1 ring-current" : "bg-white text-stone-500 border-stone-300 hover:bg-stone-50"}`}
+            >
+              {jt.label}
+            </button>
+          ))}
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <input type="date" value={draft.date} onChange={setField("date")} className={input} />
+          <input value={draft.bedName} onChange={setField("bedName")} placeholder="Bed (optional)" list="journal-bed-options" className={input} />
+          {draft.type !== "expense" && <input value={draft.plantName} onChange={setField("plantName")} placeholder="Plant (optional)" className={input} />}
+          {draft.type === "expense" && <input type="number" min="0" step="0.01" value={draft.amount} onChange={setField("amount")} placeholder="Amount ($)" className={input} />}
+          {draft.type === "harvest" && (
+            <div className="flex gap-2">
+              <input type="number" min="0" step="any" value={draft.quantity} onChange={setField("quantity")} placeholder="How much" className={input} />
+              <select value={draft.unit} onChange={setField("unit")} className="border border-stone-300 rounded-lg px-2 py-2 text-sm bg-white">
+                {Object.keys(HARVEST_UNITS).map((u) => (
+                  <option key={u} value={u}>{u}</option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+        <textarea value={draft.notes} onChange={setField("notes")} rows={2} placeholder="Notes" className={input} />
+        <div className="flex gap-2">
+          <button type="button" onClick={save} className="flex items-center gap-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-3 py-1.5 text-sm">
+            <Check size={14} /> Save
+          </button>
+          <button type="button" onClick={() => setEditing(false)} className="border border-stone-300 rounded-lg px-3 py-1.5 text-sm hover:bg-stone-50">
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white border border-stone-300 rounded-xl p-3 flex items-start gap-3">
+      <span className={`shrink-0 text-xs mono-label px-2 py-0.5 rounded-full border ${t.badge}`}>{t.label}</span>
+      <div className="flex-1 min-w-0">
+        <div className="text-xs text-stone-400 mono-label">
+          {new Date(entry.date + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
+          {entry.bedName && <> · {entry.bedName}</>}
+          {entry.plantName && <> · {entry.plantName}</>}
+          {entry.type === "expense" && entry.amount && <> · ${Number(entry.amount).toFixed(2)}</>}
+          {entry.type === "harvest" && entry.quantity > 0 && <> · {fmtAmount(entry.quantity)} {entry.unit}</>}
+        </div>
+        {entry.notes && <p className="text-sm text-stone-700 mt-0.5">{entry.notes}</p>}
+      </div>
+      <button onClick={startEdit} className="shrink-0 text-stone-400 hover:text-emerald-700 p-1 -m-1" title="Edit entry">
+        <Pencil size={13} />
+      </button>
+      <button onClick={() => onDelete(entry.id)} className="shrink-0 text-stone-400 hover:text-red-600 p-1 -m-1" title="Delete entry">
+        <Trash2 size={13} />
+      </button>
+    </div>
+  );
+}
+
+// ─── Pantry & preservation tracker ───────────────────────────────────────────────────────────
+// What's been put up from the garden (canned, frozen, dried, pickled ...), how many are left, and
+// when each is best used by. Items can name the crop they came from, which lets the tab compare
+// what was harvested (Journal → Harvest totals) against what was preserved in the same year.
+
+// Preservation methods: label, typical "best quality" window in months (a rule-of-thumb default,
+// not a food-safety guarantee; null = no default), and badge colours.
+const PANTRY_METHODS = {
+  canned: { label: "Canned", months: 12, badge: "bg-amber-100 text-amber-800 border-amber-300" },
+  jam: { label: "Jam / jelly", months: 12, badge: "bg-purple-100 text-purple-800 border-purple-300" },
+  pickled: { label: "Pickled", months: 12, badge: "bg-emerald-100 text-emerald-800 border-emerald-300" },
+  frozen: { label: "Frozen", months: 12, badge: "bg-sky-100 text-sky-800 border-sky-300" },
+  dried: { label: "Dried", months: 12, badge: "bg-orange-100 text-orange-800 border-orange-300" },
+  fermented: { label: "Fermented", months: 6, badge: "bg-lime-100 text-lime-800 border-lime-300" },
+  cellar: { label: "Root cellar", months: 4, badge: "bg-stone-100 text-stone-700 border-stone-300" },
+  other: { label: "Other", months: null, badge: "bg-stone-100 text-stone-700 border-stone-300" },
+};
+
+// Units pantry quantities are counted in.
+const PANTRY_UNITS = ["jar", "half-pint", "pint", "quart", "bag", "container", "lb", "item"];
+
+// Adds whole months to an ISO "YYYY-MM-DD" date and returns a new ISO date ("" if the input isn't a date).
+function addMonthsISO(iso, months) {
+  const d = parseISODate(iso);
+  if (!d) return "";
+  d.setMonth(d.getMonth() + months);
+  return toISODate(d);
+}
+
+// The date an item should be used by: the one the user entered, else made-date plus the method's
+// typical window. Returns { iso, estimated } or null when neither is available.
+function pantryBestBy(item) {
+  if (item.bestBy) return { iso: item.bestBy, estimated: false };
+  const months = (PANTRY_METHODS[item.method] || PANTRY_METHODS.other).months;
+  if (months && item.madeDate) return { iso: addMonthsISO(item.madeDate, months), estimated: true };
+  return null;
+}
+
+// Where an item stands relative to today: "expired" (past best-by), "soon" (within 30 days), or "ok".
+function pantryStatus(item, todayISO) {
+  const by = pantryBestBy(item);
+  if (!by || !by.iso) return "ok";
+  if (by.iso < todayISO) return "expired";
+  if (by.iso <= addDaysISO(todayISO, 30)) return "soon";
+  return "ok";
+}
+
+// ISO date `n` days after an ISO date.
+function addDaysISO(iso, n) {
+  const d = parseISODate(iso);
+  return d ? toISODate(addDays(d, n)) : iso;
+}
+
+// "3 jars" / "1 jar" / "2 half-pints": a quantity with its unit pluralised.
+function pantryQty(item) {
+  const n = Number(item.quantity) || 0;
+  return `${fmtAmount(n)} ${item.unit}${n === 1 ? "" : "s"}`;
+}
+
+// The "Pantry" tab: add / edit / delete preserved items, use them up one at a time, see what's
+// getting old, and compare harvested vs preserved per crop. State lives in GardenPlanner
+// (pantryItems, saved + backed up with the garden); this component holds only form inputs and filters.
+function PantryView({ pantryItems, journalEntries, cropOptions, onAdd, onUpdate, onDelete }) {
+  const today = toISODate(new Date());
+  const [item, setItem] = useState(""); // new item: what it is (e.g. "Dilly beans")
+  const [crop, setCrop] = useState(""); // new item: garden crop it came from (optional; links to harvest totals)
+  const [method, setMethod] = useState("canned"); // new item: preservation method (key of PANTRY_METHODS)
+  const [quantity, setQuantity] = useState(""); // new item: how many
+  const [unit, setUnit] = useState("jar"); // new item: unit for the quantity
+  const [madeDate, setMadeDate] = useState(today); // new item: date it was put up
+  const [location, setLocation] = useState(""); // new item: where it's stored (optional)
+  const [itemError, setItemError] = useState(false); // highlight the name field when left empty
+  const [methodFilter, setMethodFilter] = useState(null); // preservation method filter, or null for all
+  const [search, setSearch] = useState(""); // text filter over name/crop/location/notes
+  const [showUsedUp, setShowUsedUp] = useState(false); // include items with none left
+  const [year, setYear] = useState(new Date().getFullYear()); // year for the harvested-vs-preserved comparison
+
+  // Validates the add form and creates the item.
+  function handleAdd(e) {
+    e.preventDefault();
+    if (!item.trim()) {
+      setItemError(true);
+      return;
+    }
+    onAdd({
+      id: `pantry-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      item: item.trim(),
+      crop: crop.trim(),
+      method,
+      quantity: quantity === "" ? 1 : Math.max(0, Number(quantity)),
+      unit,
+      madeDate,
+      bestBy: "", // blank = estimate from the method
+      location: location.trim(),
+      notes: "",
+    });
+    setItem("");
+    setCrop("");
+    setQuantity("");
+    setItemError(false);
+  }
+
+  const needle = search.trim().toLowerCase();
+  const visible = pantryItems
+    .filter((p) => (showUsedUp || Number(p.quantity) > 0) && (!methodFilter || p.method === methodFilter))
+    .filter((p) => !needle || [p.item, p.crop, p.location, p.notes].some((t) => (t || "").toLowerCase().includes(needle)))
+    .sort((a, b) => {
+      // Soonest best-by first; items with no date last; used-up items at the very bottom.
+      const used = (Number(a.quantity) > 0 ? 0 : 1) - (Number(b.quantity) > 0 ? 0 : 1);
+      if (used) return used;
+      const ba = (pantryBestBy(a) || {}).iso || "9999";
+      const bb = (pantryBestBy(b) || {}).iso || "9999";
+      return ba.localeCompare(bb) || a.item.localeCompare(b.item);
+    });
+
+  // Headline numbers over everything still on hand (ignores the filters).
+  const onHand = pantryItems.filter((p) => Number(p.quantity) > 0);
+  const soonCount = onHand.filter((p) => pantryStatus(p, today) === "soon").length;
+  const expiredCount = onHand.filter((p) => pantryStatus(p, today) === "expired").length;
+  const methodCounts = {};
+  onHand.forEach((p) => {
+    methodCounts[p.method] = (methodCounts[p.method] || 0) + 1;
+  });
+
+  // Harvested (from the journal) vs preserved (from the pantry, made in the chosen year), per crop.
+  const comparison = useMemo(() => {
+    const harvested = new Map(); // lowercase crop -> { label, totals }
+    summarizeHarvests(journalEntries, "plant", year).groups.forEach((g) => harvested.set(g.label.toLowerCase(), { label: g.label, totals: g.totals }));
+    const preserved = new Map(); // lowercase crop -> { label, byUnit: {unit: amount} }
+    pantryItems.forEach((p) => {
+      if (!p.crop || !p.madeDate || Number(p.madeDate.slice(0, 4)) !== year) return;
+      const key = p.crop.trim().toLowerCase();
+      const entry = preserved.get(key) || { label: p.crop.trim(), byUnit: {} };
+      const q = Number(p.originalQuantity ?? p.quantity) || 0; // preserved = what was made, not what's left
+      entry.byUnit[p.unit] = (entry.byUnit[p.unit] || 0) + q;
+      preserved.set(key, entry);
+    });
+    const keys = Array.from(new Set([...harvested.keys(), ...preserved.keys()])).sort();
+    return keys.map((k) => ({
+      label: (harvested.get(k) || preserved.get(k)).label,
+      harvested: harvested.get(k) ? formatTotals(harvested.get(k).totals) : "—",
+      preserved: preserved.get(k)
+        ? Object.entries(preserved.get(k).byUnit).map(([u, n]) => `${fmtAmount(n)} ${u}${n === 1 ? "" : "s"}`).join(" · ")
+        : "—",
+    }));
+  }, [journalEntries, pantryItems, year]);
+
+  return (
+    <div className="max-w-5xl mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6 space-y-4">
+      {/* Add form */}
+      <section className="bg-white border border-stone-300 rounded-xl p-4">
+        <h2 className="fraunces text-lg mb-3">Add to the pantry</h2>
+        <form onSubmit={handleAdd} className="grid grid-cols-2 sm:grid-cols-6 gap-2">
+          <input
+            value={item}
+            onChange={(e) => {
+              setItem(e.target.value);
+              setItemError(false);
+            }}
+            placeholder="What is it? (e.g. Dilly beans)"
+            className={`col-span-2 border rounded-lg px-2.5 py-1.5 text-sm ${itemError ? "border-red-400 bg-red-50" : "border-stone-300"}`}
+          />
+          <input list="pantry-crop-options" value={crop} onChange={(e) => setCrop(e.target.value)} placeholder="From crop (optional)" title="Link to a garden crop to compare against harvest totals" className="col-span-2 border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <datalist id="pantry-crop-options">
+            {cropOptions.map((n) => (
+              <option key={n} value={n} />
+            ))}
+          </datalist>
+          <select value={method} onChange={(e) => setMethod(e.target.value)} className="col-span-2 border border-stone-300 rounded-lg px-2 py-1.5 text-sm bg-white">
+            {Object.entries(PANTRY_METHODS).map(([k, m]) => (
+              <option key={k} value={k}>{m.label}</option>
+            ))}
+          </select>
+          <input type="number" min="0" step="any" value={quantity} onChange={(e) => setQuantity(e.target.value)} placeholder="How many" className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <select value={unit} onChange={(e) => setUnit(e.target.value)} className="border border-stone-300 rounded-lg px-2 py-1.5 text-sm bg-white">
+            {PANTRY_UNITS.map((u) => (
+              <option key={u} value={u}>{u}</option>
+            ))}
+          </select>
+          <input type="date" value={madeDate} onChange={(e) => setMadeDate(e.target.value)} title="Date it was put up" className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Where stored" className="border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm" />
+          <button type="submit" className="col-span-2 flex items-center justify-center gap-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-3 py-1.5 text-sm">
+            <Plus size={14} /> Add item
+          </button>
+        </form>
+      </section>
+
+      {/* Headline numbers + filters */}
+      {pantryItems.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-stone-600">{onHand.length} item{onHand.length === 1 ? "" : "s"} on hand</span>
+          {soonCount > 0 && <span className="text-xs bg-amber-100 text-amber-800 border border-amber-300 rounded-full px-2 py-0.5">{soonCount} use soon</span>}
+          {expiredCount > 0 && <span className="text-xs bg-red-100 text-red-800 border border-red-300 rounded-full px-2 py-0.5">{expiredCount} past best-by</span>}
+          <span className="text-stone-300">|</span>
+          <button type="button" onClick={() => setMethodFilter(null)} className={`text-xs px-3 py-1 rounded-full border ${!methodFilter ? "bg-stone-800 text-white border-stone-800" : "bg-white text-stone-500 border-stone-300"}`}>
+            All
+          </button>
+          {Object.entries(PANTRY_METHODS).filter(([k]) => methodCounts[k]).map(([k, m]) => (
+            <button key={k} type="button" onClick={() => setMethodFilter(methodFilter === k ? null : k)} className={`text-xs px-3 py-1 rounded-full border ${methodFilter === k ? m.badge + " ring-1 ring-current" : "bg-white text-stone-500 border-stone-300"}`}>
+              {m.label} · {methodCounts[k]}
+            </button>
+          ))}
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search" className="ml-auto border border-stone-300 rounded-lg px-2.5 py-1 text-sm w-40" />
+          <label className="flex items-center gap-1 text-xs text-stone-500">
+            <input type="checkbox" checked={showUsedUp} onChange={(e) => setShowUsedUp(e.target.checked)} /> Show used up
+          </label>
+        </div>
+      )}
+
+      {/* Item list */}
+      {pantryItems.length === 0 ? (
+        <div className="bg-white border border-dashed border-stone-300 rounded-xl p-8 text-center text-sm text-stone-400">
+          Nothing in the pantry yet. Add what you've canned, frozen or dried above.
+        </div>
+      ) : visible.length === 0 ? (
+        <div className="text-sm text-stone-400 text-center py-4">Nothing matches those filters.</div>
+      ) : (
+        <div className="space-y-2">
+          {visible.map((p) => (
+            <PantryItemRow key={p.id} item={p} today={today} cropOptions={cropOptions} onUpdate={onUpdate} onDelete={onDelete} />
+          ))}
+        </div>
+      )}
+
+      {/* Harvested vs preserved */}
+      {comparison.length > 0 && (
+        <section className="bg-white border border-stone-300 rounded-xl p-4">
+          <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+            <h3 className="fraunces text-base text-stone-700">Harvested vs. preserved</h3>
+            <label className="flex items-center gap-1.5 text-xs text-stone-500">
+              Year
+              <input type="number" min="2000" max="2100" value={year} onChange={(e) => setYear(Number(e.target.value) || new Date().getFullYear())} className="w-20 border border-stone-300 rounded-lg px-2 py-1 text-sm" />
+            </label>
+          </div>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-xs text-stone-400">
+                <th className="py-1 pr-2 font-normal">Crop</th>
+                <th className="py-1 pr-2 font-normal">Harvested (Journal)</th>
+                <th className="py-1 font-normal">Preserved (made this year)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {comparison.map((r) => (
+                <tr key={r.label} className="border-t border-stone-100 text-stone-700">
+                  <td className="py-1 pr-2">{r.label}</td>
+                  <td className="py-1 pr-2">{r.harvested}</td>
+                  <td className="py-1">{r.preserved}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="text-xs text-stone-400 mt-2">Harvest amounts and preserved counts use different units, so they're shown side by side rather than as a percentage.</p>
+        </section>
+      )}
+      <p className="text-xs text-stone-400">Best-by dates are rule-of-thumb quality windows, not food-safety guarantees. Follow tested canning recipes and discard anything that looks or smells off.</p>
+    </div>
+  );
+}
+
+// One pantry item: status colouring (past best-by / use soon), quick −1 / +1 buttons for using up or
+// adding stock, and an inline edit form for every field.
+function PantryItemRow({ item, today, cropOptions, onUpdate, onDelete }) {
+  const [editing, setEditing] = useState(false); // true while the edit form is open
+  const [draft, setDraft] = useState(null); // working copy of editable fields while editing (strings as typed)
+  const status = pantryStatus(item, today);
+  const by = pantryBestBy(item);
+  const m = PANTRY_METHODS[item.method] || PANTRY_METHODS.other;
+  const qty = Number(item.quantity) || 0;
+
+  // Opens the edit form pre-filled from the item.
+  const startEdit = () => {
+    setDraft({
+      item: item.item,
+      crop: item.crop || "",
+      method: item.method,
+      quantity: String(qty),
+      unit: item.unit,
+      madeDate: item.madeDate || "",
+      bestBy: item.bestBy || "",
+      location: item.location || "",
+      notes: item.notes || "",
+    });
+    setEditing(true);
+  };
+  // Saves the edit (name required). Changing the quantity by hand also updates the "made" amount
+  // used by the harvested-vs-preserved table if it had never been set.
+  const save = () => {
+    if (!draft.item.trim()) return;
+    onUpdate(item.id, {
+      item: draft.item.trim(),
+      crop: draft.crop.trim(),
+      method: draft.method,
+      quantity: draft.quantity === "" ? 0 : Math.max(0, Number(draft.quantity)),
+      unit: draft.unit,
+      madeDate: draft.madeDate,
+      bestBy: draft.bestBy,
+      location: draft.location.trim(),
+      notes: draft.notes.trim(),
+    });
+    setEditing(false);
+  };
+  const setField = (k) => (e) => setDraft((d) => ({ ...d, [k]: e.target.value })); // onChange helper for the form
+  // Changes the stock by `delta`, never below zero. The original made-amount is remembered on first change so
+  // "preserved" totals stay accurate as jars get used.
+  const adjust = (delta) =>
+    onUpdate(item.id, {
+      quantity: Math.max(0, qty + delta),
+      originalQuantity: item.originalQuantity ?? qty,
+    });
+  const input = "w-full border border-stone-300 rounded-lg px-2.5 py-1.5 text-sm";
+
+  if (editing && draft) {
+    return (
+      <div className="bg-white border border-emerald-400 rounded-xl p-3 grid grid-cols-2 sm:grid-cols-6 gap-2">
+        <input value={draft.item} onChange={setField("item")} placeholder="Item" className={`col-span-2 ${input} ${draft.item.trim() ? "" : "border-red-400 bg-red-50"}`} />
+        <input list="pantry-crop-options" value={draft.crop} onChange={setField("crop")} placeholder="From crop" className={`col-span-2 ${input}`} />
+        <select value={draft.method} onChange={setField("method")} className={`col-span-2 ${input} bg-white`}>
+          {Object.entries(PANTRY_METHODS).map(([k, pm]) => (
+            <option key={k} value={k}>{pm.label}</option>
+          ))}
+        </select>
+        <input type="number" min="0" step="any" value={draft.quantity} onChange={setField("quantity")} placeholder="How many" className={input} />
+        <select value={draft.unit} onChange={setField("unit")} className={`${input} bg-white`}>
+          {PANTRY_UNITS.map((u) => (
+            <option key={u} value={u}>{u}</option>
+          ))}
+        </select>
+        <label className="text-xs text-stone-500 flex flex-col gap-0.5">Made<input type="date" value={draft.madeDate} onChange={setField("madeDate")} className={input} /></label>
+        <label className="text-xs text-stone-500 flex flex-col gap-0.5">Best by (blank = estimate)<input type="date" value={draft.bestBy} onChange={setField("bestBy")} className={input} /></label>
+        <input value={draft.location} onChange={setField("location")} placeholder="Where stored" className={`col-span-2 ${input}`} />
+        <input value={draft.notes} onChange={setField("notes")} placeholder="Notes" className={`col-span-2 sm:col-span-4 ${input}`} />
+        <div className="col-span-2 flex gap-2">
+          <button type="button" onClick={save} className="flex-1 flex items-center justify-center gap-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg px-3 py-1.5 text-sm">
+            <Check size={14} /> Save
+          </button>
+          <button type="button" onClick={() => setEditing(false)} className="border border-stone-300 rounded-lg px-3 py-1.5 text-sm hover:bg-stone-50">
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`bg-white border rounded-xl p-3 flex items-center gap-3 flex-wrap ${status === "expired" ? "border-red-300" : status === "soon" ? "border-amber-300" : "border-stone-300"} ${qty === 0 ? "opacity-50" : ""}`}>
+      <span className={`shrink-0 text-xs mono-label px-2 py-0.5 rounded-full border ${m.badge}`}>{m.label}</span>
+      <div className="flex-1 min-w-0">
+        <div className="text-stone-800 font-medium">
+          {item.item}
+          {item.crop && <span className="text-stone-400 font-normal text-xs"> · from {item.crop}</span>}
+        </div>
+        <div className="text-xs text-stone-500">
+          {[item.madeDate ? `made ${shortDate(parseISODate(item.madeDate) || new Date())} ${item.madeDate.slice(0, 4)}` : null, item.location].filter(Boolean).join(" · ")}
+          {by && by.iso && (
+            <span className={status === "expired" ? "text-red-600" : status === "soon" ? "text-amber-600" : ""}>
+              {" · "}
+              {by.estimated ? "est. " : ""}best by {shortDate(parseISODate(by.iso) || new Date())} {by.iso.slice(0, 4)}
+              {status === "expired" ? " (past)" : status === "soon" ? " (soon)" : ""}
+            </span>
+          )}
+        </div>
+        {item.notes && <div className="text-xs text-stone-400">{item.notes}</div>}
+      </div>
+      <div className="flex items-center gap-1.5">
+        <button type="button" onClick={() => adjust(-1)} disabled={qty === 0} className="w-6 h-6 rounded-full border border-stone-300 text-stone-600 hover:bg-stone-50 disabled:opacity-30 leading-none" title="Use one">
+          −
+        </button>
+        <span className="text-sm text-stone-800 w-20 text-center">{qty === 0 ? "used up" : pantryQty(item)}</span>
+        <button type="button" onClick={() => adjust(1)} className="w-6 h-6 rounded-full border border-stone-300 text-stone-600 hover:bg-stone-50 leading-none" title="Add one">
+          +
+        </button>
+      </div>
+      <button type="button" onClick={startEdit} className="text-stone-400 hover:text-emerald-700 p-1" title="Edit">
+        <Pencil size={14} />
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          if (window.confirm(`Delete ${item.item} from the pantry?`)) onDelete(item.id);
+        }}
+        className="text-stone-400 hover:text-red-600 p-1"
+        title="Delete"
+      >
+        <Trash2 size={14} />
+      </button>
+    </div>
+  );
+}
+
 // The "Journal" tab: free-form dated entries (harvest, pest/disease, expense, general note),
 // each optionally tagged to a bed — independent of any plant, calendar, or history data; this is
 // just a simple running log the user writes and reads back chronologically.
-function JournalView({ journalEntries, beds, onAddEntry, onDeleteEntry }) {
+function JournalView({ journalEntries, beds, onAddEntry, onUpdateEntry, onDeleteEntry }) {
   const [type, setType] = useState("harvest"); // journal entry type being written
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10)); // entry date (defaults to today)
   const [bedName, setBedName] = useState(""); // bed the entry relates to (optional)
   const [plantName, setPlantName] = useState(""); // plant the entry relates to (optional)
-  const [amount, setAmount] = useState(""); // harvest quantity or expense amount, as typed
+  const [amount, setAmount] = useState(""); // expense amount, as typed
+  const [quantity, setQuantity] = useState(""); // harvest amount, as typed (a number; pairs with harvestUnit)
+  const [harvestUnit, setHarvestUnit] = useState("lb"); // unit for the harvest amount (a key of HARVEST_UNITS)
   const [notes, setNotes] = useState(""); // free-text notes
   const [filter, setFilter] = useState(null); // journal type filter, or null for all
 
@@ -1610,7 +2263,7 @@ function JournalView({ journalEntries, beds, onAddEntry, onDeleteEntry }) {
   // Validates the journal form (an entry needs some content, expenses need an amount or note) and hands it to onAddEntry.
   function handleSubmit(e) {
     e.preventDefault();
-    if (!notes.trim() && !plantName.trim() && type !== "expense") return;
+    if (!notes.trim() && !plantName.trim() && !(type === "harvest" && Number(quantity) > 0) && type !== "expense") return;
     if (type === "expense" && !amount && !notes.trim()) return;
     onAddEntry({
       type,
@@ -1618,10 +2271,14 @@ function JournalView({ journalEntries, beds, onAddEntry, onDeleteEntry }) {
       bedName: bedName.trim(),
       plantName: plantName.trim(),
       amount: type === "expense" ? amount : "",
+      // Harvests carry a structured amount so Harvest totals can add them up (null when left blank).
+      quantity: type === "harvest" && Number(quantity) > 0 ? Number(quantity) : null,
+      unit: type === "harvest" && Number(quantity) > 0 ? harvestUnit : null,
       notes: notes.trim(),
     });
     setPlantName("");
     setAmount("");
+    setQuantity("");
     setNotes("");
   }
 
@@ -1702,9 +2359,31 @@ function JournalView({ journalEntries, beds, onAddEntry, onDeleteEntry }) {
               ))}
             </datalist>
           </div>
+          {type === "harvest" && (
+            // Structured harvest amount: a number plus a unit, so totals can be calculated
+            <div>
+              <label className="text-xs mono-label text-stone-500 block mb-1">How much</label>
+              <div className="flex gap-2">
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={quantity}
+                  onChange={(e) => setQuantity(e.target.value)}
+                  placeholder="e.g. 3.5"
+                  className="w-32 border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                />
+                <select value={harvestUnit} onChange={(e) => setHarvestUnit(e.target.value)} className="border border-stone-300 rounded-lg px-2 py-2 text-sm bg-white">
+                  {Object.keys(HARVEST_UNITS).map((u) => (
+                    <option key={u} value={u}>{u}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
           <div>
             <label className="text-xs mono-label text-stone-500 block mb-1">
-              {type === "harvest" ? "What & how much (e.g. \"3 lbs tomatoes\")" : type === "pest" ? "What you saw" : type === "expense" ? "What it was for" : "Notes"}
+              {type === "harvest" ? "Notes (optional)" : type === "pest" ? "What you saw" : type === "expense" ? "What it was for" : "Notes"}
             </label>
             <textarea
               value={notes}
@@ -1718,6 +2397,8 @@ function JournalView({ journalEntries, beds, onAddEntry, onDeleteEntry }) {
           </button>
         </form>
       </div>
+
+      <HarvestTotals journalEntries={journalEntries} />
 
       {journalEntries.length === 0 ? (
         <div className="bg-white border border-stone-300 rounded-xl p-6 text-center text-stone-400 text-sm">
@@ -1749,26 +2430,9 @@ function JournalView({ journalEntries, beds, onAddEntry, onDeleteEntry }) {
           </div>
 
           <div className="space-y-2">
-            {filtered.map((entry) => {
-              const t = JOURNAL_TYPES[entry.type] || JOURNAL_TYPES.note;
-              return (
-                <div key={entry.id} className="bg-white border border-stone-300 rounded-xl p-3 flex items-start gap-3">
-                  <span className={`shrink-0 text-xs mono-label px-2 py-0.5 rounded-full border ${t.badge}`}>{t.label}</span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-xs text-stone-400 mono-label">
-                      {new Date(entry.date + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
-                      {entry.bedName && <> · {entry.bedName}</>}
-                      {entry.plantName && <> · {entry.plantName}</>}
-                      {entry.type === "expense" && entry.amount && <> · ${Number(entry.amount).toFixed(2)}</>}
-                    </div>
-                    {entry.notes && <p className="text-sm text-stone-700 mt-0.5">{entry.notes}</p>}
-                  </div>
-                  <button onClick={() => onDeleteEntry(entry.id)} className="shrink-0 text-stone-400 hover:text-red-600 p-1 -m-1" title="Delete entry">
-                    <Trash2 size={13} />
-                  </button>
-                </div>
-              );
-            })}
+            {filtered.map((entry) => (
+              <JournalEntryRow key={entry.id} entry={entry} bedNameOptions={bedNameOptions} onSave={onUpdateEntry} onDelete={onDeleteEntry} />
+            ))}
           </div>
         </>
       )}
@@ -1802,6 +2466,431 @@ const PLANT_FAMILY_KEYS = Object.keys(PLANT_FAMILIES);
 function matchPlantFamily(plantName) {
   const key = matchKeyIn(plantName, PLANT_FAMILY_KEYS);
   return key ? PLANT_FAMILIES[key] : null;
+}
+
+// ─── Native / invasive status (region-aware) ─────────────────────────────────────────────────
+// Each plant can be marked native, non-native, aggressive (spreads hard — contain it) or invasive.
+// What counts as native or invasive depends heavily on WHERE you garden, so the built-in reference
+// list is organised by region: the user's state (picked in the header, or filled in from their ZIP
+// code) maps to one of the regions below, and only entries that apply to that region are used. The
+// user can always override a single plant in its details window. This is a starting point built
+// from broad regional knowledge — native ranges and invasive listings are decided state by state,
+// so check local sources (your state's invasive species program, native plant society, extension office).
+
+// Two-letter state codes -> display name, for the header's state picker.
+const US_STATES = {
+  AL: "Alabama", AK: "Alaska", AZ: "Arizona", AR: "Arkansas", CA: "California", CO: "Colorado", CT: "Connecticut",
+  DE: "Delaware", DC: "District of Columbia", FL: "Florida", GA: "Georgia", HI: "Hawaii", ID: "Idaho", IL: "Illinois",
+  IN: "Indiana", IA: "Iowa", KS: "Kansas", KY: "Kentucky", LA: "Louisiana", ME: "Maine", MD: "Maryland",
+  MA: "Massachusetts", MI: "Michigan", MN: "Minnesota", MS: "Mississippi", MO: "Missouri", MT: "Montana",
+  NE: "Nebraska", NV: "Nevada", NH: "New Hampshire", NJ: "New Jersey", NM: "New Mexico", NY: "New York",
+  NC: "North Carolina", ND: "North Dakota", OH: "Ohio", OK: "Oklahoma", OR: "Oregon", PA: "Pennsylvania",
+  RI: "Rhode Island", SC: "South Carolina", SD: "South Dakota", TN: "Tennessee", TX: "Texas", UT: "Utah",
+  VT: "Vermont", VA: "Virginia", WA: "Washington", WV: "West Virginia", WI: "Wisconsin", WY: "Wyoming",
+};
+
+// The broad regions the reference list is written for, with a display label.
+const NATIVE_REGIONS = {
+  NE: "Northeast & Mid-Atlantic",
+  MW: "Midwest & Great Lakes",
+  PL: "Northern Great Plains",
+  SE: "Southeast",
+  SC: "South Central (TX, OK, AR, LA)",
+  RM: "Rocky Mountains",
+  SW: "Desert Southwest",
+  PNW: "Pacific Northwest",
+  CA: "California",
+};
+
+// State -> region. Alaska and Hawaii (and anywhere outside the US) have no regional list yet.
+const STATE_TO_REGION = {
+  ME: "NE", NH: "NE", VT: "NE", MA: "NE", RI: "NE", CT: "NE", NY: "NE", NJ: "NE", PA: "NE", DE: "NE", MD: "NE", DC: "NE",
+  MI: "MW", WI: "MW", MN: "MW", IL: "MW", IN: "MW", OH: "MW", IA: "MW", MO: "MW",
+  ND: "PL", SD: "PL", NE: "PL", KS: "PL",
+  VA: "SE", WV: "SE", NC: "SE", SC: "SE", GA: "SE", FL: "SE", AL: "SE", MS: "SE", TN: "SE", KY: "SE",
+  TX: "SC", OK: "SC", AR: "SC", LA: "SC",
+  MT: "RM", ID: "RM", WY: "RM", CO: "RM", UT: "RM",
+  AZ: "SW", NM: "SW", NV: "SW",
+  WA: "PNW", OR: "PNW",
+  CA: "CA",
+};
+
+// US ZIP code ranges by state (USPS three-digit prefix blocks), used to fill in the state from a ZIP
+// code without any network lookup. Each entry is [firstZip, lastZip, state]; a few states have extra blocks.
+const ZIP_RANGES = [
+  [1000, 2799, "MA"], [2800, 2999, "RI"], [3000, 3899, "NH"], [3900, 4999, "ME"], [5000, 5999, "VT"], [6000, 6999, "CT"],
+  [7000, 8999, "NJ"], [10000, 14999, "NY"], [15000, 19699, "PA"], [19700, 19999, "DE"], [20000, 20599, "DC"],
+  [20600, 21999, "MD"], [22000, 24699, "VA"], [24700, 26899, "WV"], [27000, 28999, "NC"], [29000, 29999, "SC"],
+  [30000, 31999, "GA"], [32000, 34999, "FL"], [35000, 36999, "AL"], [37000, 38599, "TN"], [38600, 39799, "MS"],
+  [39800, 39999, "GA"], [40000, 42799, "KY"], [43000, 45999, "OH"], [46000, 47999, "IN"], [48000, 49999, "MI"],
+  [50000, 52999, "IA"], [53000, 54999, "WI"], [55000, 56799, "MN"], [57000, 57799, "SD"], [58000, 58899, "ND"],
+  [59000, 59999, "MT"], [60000, 62999, "IL"], [63000, 65999, "MO"], [66000, 67999, "KS"], [68000, 69399, "NE"],
+  [70000, 71599, "LA"], [71600, 72999, "AR"], [73000, 74999, "OK"], [75000, 79999, "TX"], [80000, 81699, "CO"],
+  [82000, 83199, "WY"], [83200, 83999, "ID"], [84000, 84799, "UT"], [85000, 86599, "AZ"], [87000, 88499, "NM"],
+  [88500, 88599, "TX"], [88900, 89899, "NV"], [90000, 96199, "CA"], [96700, 96899, "HI"], [97000, 97999, "OR"],
+  [98000, 99499, "WA"], [99500, 99999, "AK"],
+];
+
+// State code for a 5-digit US ZIP code, or "" if it isn't one we recognise.
+function stateFromZip(zip) {
+  if (!/^\d{5}$/.test(zip || "")) return "";
+  const n = parseInt(zip, 10);
+  const hit = ZIP_RANGES.find(([lo, hi]) => n >= lo && n <= hi);
+  return hit ? hit[2] : "";
+}
+
+// The four statuses: label, one-line explanation, pill classes, and the plant-dot colour on the map.
+const NATIVE_STATUS = {
+  native: { label: "Native", note: "Grows naturally in this region — supports local pollinators and wildlife.", pill: "bg-teal-100 text-teal-800 border-teal-300", dot: "bg-teal-600" },
+  non_native: { label: "Non-native", note: "Not from this region. Not a problem on its own — most garden crops are in this group.", pill: "bg-stone-100 text-stone-700 border-stone-300", dot: "bg-emerald-600" },
+  aggressive: { label: "Spreads aggressively", note: "Spreads quickly by runners or seed — grow it in a contained spot (pot, edging, its own bed).", pill: "bg-amber-100 text-amber-800 border-amber-300", dot: "bg-amber-500" },
+  invasive: { label: "Invasive", note: "Escapes gardens and harms natural areas in your region. Avoid planting it, and remove it where it has spread.", pill: "bg-red-100 text-red-800 border-red-300", dot: "bg-red-600" },
+};
+
+// Region shorthand used in the list below.
+const ALL_US = "NE MW PL SE SC RM SW PNW CA";
+
+// Reference list: lowercase plant-name fragment -> [status, regions where that status applies].
+// Regions are the codes in NATIVE_REGIONS, "ALL_US" (every US region), or "ANY" (everywhere,
+// including outside the US). A plant matches the LONGEST name fragment it contains whose regions
+// include the user's, so "mountain mint" can be native where it grows wild and fall back to the
+// general "mint" (spreads aggressively) elsewhere.
+const NATIVE_STATUS_REFERENCE = {
+  // ── Native wildflowers, grasses and perennials ──
+  "black-eyed susan": ["native", "NE MW PL SE SC"],
+  "wild bergamot": ["native", "NE MW PL SE SC RM SW"],
+  "milkweed": ["native", ALL_US],
+  "butterfly weed": ["native", "NE MW PL SE SC SW"],
+  "new england aster": ["native", "NE MW PL SE"],
+  "goldenrod": ["native", ALL_US],
+  "joe-pye weed": ["native", "NE MW SE"],
+  "joe pye weed": ["native", "NE MW SE"],
+  "little bluestem": ["native", "NE MW PL SE SC RM SW"],
+  "big bluestem": ["native", "NE MW PL SE SC RM"],
+  "switchgrass": ["native", "NE MW PL SE SC RM SW"],
+  "prairie dropseed": ["native", "MW PL"],
+  "indian grass": ["native", "NE MW PL SE SC"],
+  "wild lupine": ["native", "NE MW SE"],
+  "cardinal flower": ["native", "NE MW PL SE SC SW"],
+  "blue flag iris": ["native", "NE MW"],
+  "blue vervain": ["native", "NE MW PL SE SC"],
+  "spiderwort": ["native", "MW PL SE SC"],
+  "golden alexanders": ["native", "NE MW PL SE SC"],
+  "prairie smoke": ["native", "MW PL RM"],
+  "wild geranium": ["native", "NE MW SE"],
+  "wild columbine": ["native", "NE MW PL SE SC"],
+  "trillium": ["native", "NE MW SE PNW"],
+  "bloodroot": ["native", "NE MW SE"],
+  "jack-in-the-pulpit": ["native", "NE MW SE"],
+  "mountain mint": ["native", "NE MW PL SE SC"],
+  "partridge pea": ["native", "NE MW PL SE SC"],
+  "beach pea": ["native", "NE PNW CA MW"],
+  "hog peanut": ["native", "NE MW PL SE SC"],
+  "pearly everlasting": ["native", "NE MW PL RM PNW CA SW"],
+  "sweet pepperbush": ["native", "NE SE"],
+  "pepperbush": ["native", "NE SE"],
+  "wild onion": ["native", "NE MW PL SE SC RM SW"],
+  "nodding onion": ["native", "NE MW PL RM"],
+  "prairie onion": ["native", "MW PL SC"],
+  "marsh marigold": ["native", "NE MW PL"],
+  "wild mint": ["native", "NE MW PL RM PNW"],
+  "horsemint": ["native", "NE MW PL SE SC"],
+  "wild basil": ["native", "NE MW PL SE"],
+  "skunk cabbage": ["native", "NE MW PNW"],
+  "squirrel corn": ["native", "NE MW SE"],
+  "anise hyssop": ["native", "MW PL RM"],
+  "foxglove beardtongue": ["native", "NE MW PL SE SC"],
+  "culver's root": ["native", "NE MW PL SE"],
+  "obedient plant": ["native", "NE MW SE SC"],
+  "sneezeweed": ["native", "NE MW PL SE SC"],
+  "yellow coneflower": ["native", "NE MW PL SE SC"],
+  "gray-headed coneflower": ["native", "NE MW PL SE SC"],
+  "american bittersweet": ["native", "NE MW PL SE SC"],
+  // ── Native edibles ──
+  "pawpaw": ["native", "NE MW SE SC"],
+  "serviceberry": ["native", ALL_US],
+  "juneberry": ["native", ALL_US],
+  "elderberry": ["native", "NE MW PL SE SC"],
+  "blueberry": ["native", "NE MW SE"],
+  "black raspberry": ["native", "NE MW PL SE SC"],
+  "wild strawberry": ["native", ALL_US],
+  "hazelnut": ["native", "NE MW PL SE SC"],
+  "sunchoke": ["native", "NE MW PL SE SC"],
+  "jerusalem artichoke": ["native", "NE MW PL SE SC"],
+  "ramps": ["native", "NE MW SE"],
+  "wild leek": ["native", "NE MW SE"],
+  "groundnut": ["native", "NE MW PL SE SC"],
+  "chokeberry": ["native", "NE MW SE"],
+  "aronia": ["native", "NE MW SE"],
+  "nannyberry": ["native", "NE MW PL RM"],
+  // ── Native trees ──
+  "sugar maple": ["native", "NE MW SE"],
+  "red maple": ["native", "NE MW SE SC PL"],
+  "silver maple": ["native", "NE MW PL SE SC"],
+  "white oak": ["native", "NE MW SE SC PL"],
+  "bur oak": ["native", "NE MW PL SC"],
+  "red oak": ["native", "NE MW SE"],
+  "swamp white oak": ["native", "NE MW"],
+  "tulip tree": ["native", "NE MW SE"],
+  "basswood": ["native", "NE MW PL SE"],
+  "black cherry": ["native", "NE MW PL SE SC"],
+  "white pine": ["native", "NE MW SE"],
+  "eastern red cedar": ["native", "NE MW PL SE SC"],
+  // ── Spread hard in gardens (anywhere) ──
+  "mint": ["aggressive", "ANY"], "peppermint": ["aggressive", "ANY"], "spearmint": ["aggressive", "ANY"],
+  "lemon balm": ["aggressive", "ANY"], "horseradish": ["aggressive", "ANY"], "comfrey": ["aggressive", "ANY"],
+  "bamboo": ["invasive", "ANY"],
+  "lucky bamboo": ["non_native", "ANY"], "clumping bamboo": ["non_native", "ANY"], "fargesia": ["non_native", "ANY"],
+  "creeping jenny": [["invasive", "NE MW SE"], ["aggressive", "ANY"]], "creeping charlie": [["invasive", "NE SE"], ["aggressive", "ANY"]], "ground ivy": [["invasive", "NE SE"], ["aggressive", "ANY"]],
+  // ── Invasive, by region ──
+  "garlic mustard": [["invasive", "NE MW PL SE SC RM PNW CA"], ["aggressive", "ANY"]],
+  "dame's rocket": ["invasive", "NE MW RM"],
+  "purple loosestrife": ["invasive", ALL_US],
+  "yellow flag iris": ["invasive", "NE MW SE SC RM PNW CA"],
+  "goutweed": ["invasive", "NE MW PL RM"],
+  "bishop's weed": ["invasive", "NE MW PL RM"],
+  "japanese knotweed": ["invasive", ALL_US],
+  "giant hogweed": ["invasive", "NE MW SE PNW"],
+  "wild parsnip": ["invasive", "NE MW PL RM"],
+  "spotted knapweed": ["invasive", "NE MW PL SE RM SW PNW CA"],
+  "canada thistle": ["invasive", ALL_US],
+  "teasel": ["invasive", "NE MW PL SC SW RM PNW CA"],
+  "phragmites": ["invasive", ALL_US],
+  "reed canarygrass": ["invasive", "NE MW PL RM PNW"],
+  "autumn olive": ["invasive", "NE MW PL SE SC"],
+  "russian olive": ["invasive", "NE MW PL SC RM SW PNW CA"],
+  "buckthorn": ["invasive", "NE MW PL SE RM"],
+  "barberry": ["invasive", "NE MW PL SE PNW"],
+  "multiflora rose": ["invasive", "NE MW PL SE SC"],
+  "bush honeysuckle": ["invasive", "NE MW PL SE SC"],
+  "amur honeysuckle": ["invasive", "NE MW PL SE SC"],
+  "tatarian honeysuckle": ["invasive", "NE MW PL SE SC"],
+  "japanese honeysuckle": ["invasive", "NE MW PL SE SC"],
+  "oriental bittersweet": ["invasive", "NE MW SE PNW"],
+  "asiatic bittersweet": ["invasive", "NE MW SE PNW"],
+  "burning bush": ["invasive", "NE MW SE"],
+  "norway maple": ["invasive", "NE MW PNW"],
+  "tree of heaven": ["invasive", ALL_US],
+  "english ivy": ["invasive", "NE MW SE SC PNW CA"],
+  "periwinkle": ["invasive", "NE MW SE SC PNW CA"],
+  "vinca minor": ["invasive", "NE MW SE SC PNW CA"],
+  "callery pear": ["invasive", "NE MW PL SE SC PNW"],
+  "bradford pear": ["invasive", "NE MW PL SE SC PNW"],
+  "flowering rush": ["invasive", "NE MW RM PNW SW"],
+  "eurasian watermilfoil": ["invasive", ALL_US],
+  "crown vetch": ["invasive", "NE MW PL"],
+  "japanese stiltgrass": ["invasive", "NE MW SE"],
+  "kudzu": ["invasive", "ANY"],
+  "golden bamboo": ["invasive", "ANY"],
+  "tall buttercup": ["invasive", "RM PNW"],
+  "japanese pachysandra": ["invasive", "NE"],
+  "orange day-lily": ["invasive", "NE MW"],
+  "tawny daylily": ["invasive", "NE MW"],
+  "chinese fountaingrass": ["invasive", "NE"],
+  "black jetbead": ["invasive", "NE MW"],
+  "doublefile viburnum": ["invasive", "NE"],
+  "linden viburnum": ["invasive", "NE"],
+  "tea viburnum": ["invasive", "NE"],
+  "beefsteak plant": ["invasive", "NE MW SE"],
+  "perilla": ["invasive", "NE MW SE"],
+  "shiso": ["invasive", "NE MW SE"],
+  "birdsfoot trefoil": ["invasive", "NE MW PL"],
+  "japanese chaff flower": ["invasive", "NE MW SE"],
+  "air potato": ["invasive", "SE SC"],
+  "air-potato": ["invasive", "SE SC"],
+  "coral ardisia": ["invasive", "SE SC"],
+  "japanese ardisia": ["invasive", "SE SC"],
+  "purple beautyberry": ["invasive", "SE SC"],
+  "japanese beautyberry": ["invasive", "SE SC"],
+  "chinese elm": ["invasive", "SE SC"],
+  "paper mulberry": ["invasive", "SE SC"],
+  "paper-mulberry": ["invasive", "SE SC"],
+  "trifoliate orange": ["invasive", "SE SC"],
+  "macartney rose": ["invasive", "SE SC"],
+  "chinese parasoltree": ["invasive", "SE SC"],
+  "bushkiller": ["invasive", "SE SC"],
+  "torpedograss": ["invasive", "SE SC"],
+  "tropical soda apple": ["invasive", "SE SC"],
+  "beach vitex": ["invasive", "SE SC"],
+  "milk thistle": ["invasive", "SE SC SW CA"],
+  "maiden grass": ["invasive", "NE MW SE"],
+  "miscanthus sinensis": ["invasive", "NE MW SE"],
+  "french broom": ["invasive", "PNW CA"],
+  "spanish broom": ["invasive", "PNW CA"],
+  "marram grass": ["invasive", "PNW CA"],
+  "european beachgrass": ["invasive", "PNW CA"],
+  "evergreen blackberry": ["invasive", "PNW CA"],
+  "crack willow": ["invasive", "NE MW PNW"],
+  "fennel": ["invasive", "PNW CA"],
+  "yellow toadflax": ["invasive", "NE MW PL RM SW PNW"],
+  "butter and eggs": ["invasive", "NE MW PL RM SW PNW"],
+  "mullein": ["invasive", "RM"],
+  "burdock": ["invasive", "RM"],
+  "black henbane": ["invasive", "RM PL SW PNW"],
+  "palmer amaranth": ["invasive", "PL SC SE SW MW NE"],
+  "blueweed": ["invasive", "RM PNW"],
+  "viper's bugloss": ["invasive", "RM PNW"],
+  "giant knotweed": ["invasive", ALL_US],
+  "bohemian knotweed": ["invasive", ALL_US],
+  "himalayan knotweed": ["invasive", ALL_US],
+  "roundleaf bittersweet": ["invasive", "NE MW SE PNW"],
+  "poison hemlock": ["invasive", ALL_US],
+  "garden yellow loosestrife": ["invasive", "NE MW PNW"],
+  "gorse": ["invasive", "PNW CA"],
+  "herb robert": ["invasive", "PNW"],
+  "yellow archangel": ["invasive", "NE PNW"],
+  "english hawthorn": ["invasive", "PNW"],
+  "ornamental jewelweed": ["invasive", "NE PNW"],
+  "policeman's helmet": ["invasive", "NE PNW"],
+  "old man's beard": ["invasive", "PNW CA"],
+  "spurge laurel": ["invasive", "PNW"],
+  "cape-ivy": ["invasive", "PNW CA"],
+  "coltsfoot": ["invasive", "NE PNW"],
+  "creeping buttercup": ["invasive", "NE PNW"],
+  "houndstongue": ["invasive", "PL RM SW PNW"],
+  "st. john's wort": ["invasive", "RM PNW SW"],
+  "st. johnswort": ["invasive", "RM PNW SW"],
+  "st john's wort": ["invasive", "RM PNW SW"],
+  "amur maple": ["invasive", "NE MW"],
+  "sycamore maple": ["invasive", "NE"],
+  "cypress spurge": ["invasive", "NE MW RM"],
+  "silver lace vine": ["invasive", "NE"],
+  "sea buckthorn": ["invasive", "NE"],
+  "common valerian": ["invasive", "NE"],
+  "butterbur": ["invasive", "NE"],
+  "ribbon grass": ["invasive", "NE MW PL"],
+  "white poplar": ["invasive", "NE MW"],
+  "wild chervil": ["invasive", "NE MW"],
+  "cinnamon vine": ["invasive", "NE MW SE"],
+  "shining geranium": ["invasive", "NE"],
+  "elephant ear": ["invasive", "SE SC"],
+  "monkey grass": ["invasive", "SE SC"],
+  "big blue lilyturf": ["invasive", "SE SC"],
+  "cherokee rose": ["invasive", "SE SC"],
+  "thorny olive": ["invasive", "SE SC MW"],
+  "sacred bamboo": [["invasive", "NE SE SC"], ["non_native", "ANY"]],
+  "photinia": ["invasive", "SE SC"],
+  "rugosa rose": ["aggressive", "NE"],
+  "cup plant": [["invasive", "NE"], ["native", "MW PL SE SC"]],
+  "chinese wisteria": ["invasive", "NE MW SE SC"],
+  "japanese wisteria": ["invasive", "NE MW SE SC"],
+  "sericea lespedeza": ["invasive", "MW PL SE SC"],
+  "japanese hops": ["invasive", "NE MW PL"],
+  "chocolate vine": ["invasive", "NE MW SE"],
+  "akebia": ["invasive", "NE MW SE"],
+  "sweet autumn clematis": ["invasive", "NE MW SE SC"],
+  "japanese spiraea": ["invasive", "NE SE MW"],
+  "leatherleaf mahonia": ["invasive", "SE"],
+  "border privet": ["invasive", "NE MW"],
+  "european privet": ["invasive", "NE MW"],
+  "japanese privet": ["invasive", "NE SE SC"],
+  "golden raintree": ["invasive", "SE"],
+  "moneywort": ["invasive", "NE MW"],
+  "common privet": ["invasive", "NE MW"],
+  "siberian elm": ["invasive", "MW PL SC RM SW"],
+  "princess tree": ["invasive", "NE MW SE SC"],
+  "paulownia": ["invasive", "NE MW SE SC"],
+  "white mulberry": ["invasive", "MW"],
+  "leafy spurge": ["invasive", "MW PL RM SW PNW NE"],
+  "common tansy": ["invasive", "MW PL RM"],
+  "dalmatian toadflax": ["invasive", "PL RM SW PNW"],
+  "yellow starthistle": ["invasive", "RM SW PNW CA"],
+  "bouncingbet": ["invasive", "RM"],
+  "myrtle spurge": ["invasive", "RM SW PNW"],
+  "oxeye daisy": ["invasive", "RM SW PNW"],
+  "fountain grass": ["invasive", "SW CA"],
+  "buffelgrass": ["invasive", "SW"],
+  "japanese climbing fern": ["invasive", "SE SC"],
+  "camphor tree": ["invasive", "SE SC"],
+  "brazilian pepper": [["invasive", "SE SC"], ["aggressive", "ANY"]],
+  "chinaberry": ["invasive", "SE SC"],
+  "mile-a-minute": ["invasive", "NE SE"],
+  "porcelain berry": ["invasive", "NE MW SE"],
+  "porcelainberry": ["invasive", "NE MW SE"],
+  "wineberry": ["invasive", "NE SE"],
+  "mugwort": ["invasive", "NE MW"],
+  "lesser celandine": ["invasive", "NE MW SE PNW"],
+  "black swallow-wort": ["invasive", "NE MW"],
+  "pale swallow-wort": ["invasive", "NE MW"],
+  "winter creeper": ["invasive", "NE MW SE"],
+  "wintercreeper": ["invasive", "NE MW SE"],
+  "chinese silver grass": ["invasive", "NE MW SE"],
+  "cogongrass": ["invasive", "SE SC"],
+  "chinese yam": ["invasive", "NE MW SE"],
+  "japanese angelica": ["invasive", "NE"],
+  "amur cork": ["invasive", "NE MW"],
+  "garden loosestrife": ["invasive", "NE MW RM PNW"],
+  "chinese privet": ["invasive", "NE MW SE SC"],
+  "johnsongrass": ["invasive", "MW PL SE SC SW CA PNW RM"],
+  "giant reed": ["invasive", "SE SC SW CA RM PNW"],
+  "tamarisk": ["invasive", "PL SC SE RM SW CA PNW"],
+  "saltcedar": ["invasive", "PL SC SE RM SW CA PNW"],
+  "scotch broom": ["invasive", "PNW CA RM MW SE NE"],
+  "himalayan blackberry": ["invasive", "PNW CA"],
+  "english holly": ["invasive", "PNW CA"],
+  "butterfly bush": ["invasive", "NE SE PNW CA"],
+  "pampas grass": ["invasive", "SE PNW CA"],
+  "vinca major": ["invasive", "SE PNW CA"],
+  "chinese tallow": ["invasive", "SE SC CA"],
+  "nandina": ["invasive", "NE SE SC"],
+  "heavenly bamboo": [["invasive", "NE SE SC"], ["non_native", "ANY"]],
+  "mimosa tree": ["invasive", "SE SC"],
+  "silk tree": ["invasive", "SE SC"],
+  "mexican petunia": ["invasive", "SE SC"],
+  "lantana": ["invasive", "SE SC"],
+  // ── Ordinary garden crops: non-native, nothing to worry about ──
+  "tomato": ["non_native", "ANY"], "pepper": ["non_native", "ANY"], "eggplant": ["non_native", "ANY"],
+  "cucumber": ["non_native", "ANY"], "squash": ["non_native", "ANY"], "zucchini": ["non_native", "ANY"],
+  "pumpkin": ["non_native", "ANY"], "bean": ["non_native", "ANY"], "corn": ["non_native", "ANY"],
+  "basil": ["non_native", "ANY"], "marigold": ["non_native", "ANY"], "pea": ["non_native", "ANY"],
+  "spinach": ["non_native", "ANY"], "carrot": ["non_native", "ANY"], "beet": ["non_native", "ANY"],
+  "radish": ["non_native", "ANY"], "potato": ["non_native", "ANY"], "chard": ["non_native", "ANY"],
+  "kale": ["non_native", "ANY"], "onion": ["non_native", "ANY"], "lettuce": ["non_native", "ANY"],
+  "broccoli": ["non_native", "ANY"], "cabbage": ["non_native", "ANY"], "cilantro": ["non_native", "ANY"],
+  "parsley": ["non_native", "ANY"], "garlic": ["non_native", "ANY"],
+};
+// The reference list with each entry's region string split into a Set, longest names first so the
+// most specific match is tried first.
+// A name may carry several rules (an array of [status, regions] pairs, tried in order) — e.g. creeping
+// Jenny is invasive in the East but only "spreads aggressively" elsewhere.
+const NATIVE_STATUS_ENTRIES = Object.entries(NATIVE_STATUS_REFERENCE)
+  .flatMap(([key, v]) => (Array.isArray(v[0]) ? v : [v]).map(([status, regions]) => ({ key, status, regions: new Set(regions.split(" ")) })))
+  .sort((a, b) => b.key.length - a.key.length);
+
+// Cache of (region, lowercase name) -> { status, matchKey } so repeated lookups (every plant, every render) are cheap.
+const nativeStatusCache = new Map();
+
+// Looks up the reference-list status for a plant name in a region ("" / unknown region = only the
+// everywhere entries). Returns { status, matchKey } or { status: null }.
+function referenceNativeStatus(plantName, regionCode) {
+  const name = (plantName || "").toLowerCase();
+  const cacheKey = `${regionCode || "-"}|${name}`;
+  let hit = nativeStatusCache.get(cacheKey);
+  if (hit) return hit;
+  hit = { status: null, matchKey: null };
+  let blocked = ""; // key of a more specific name that matched but not for this region (e.g. "marsh marigold" with no region)
+  for (const e of NATIVE_STATUS_ENTRIES) {
+    if (!name.includes(e.key)) continue;
+    // Applies if it's an everywhere entry, or covers the user's region (ALL_US entries list every US region).
+    if (e.regions.has("ANY") || (regionCode && e.regions.has(regionCode))) {
+      // Don't let a short crop word ("marigold", "pea") label a plant whose longer name we recognised but can't place here.
+      if (blocked && blocked !== e.key && e.status === "non_native") continue;
+      hit = { status: e.status, matchKey: e.key };
+      break;
+    }
+    blocked = blocked || e.key;
+  }
+  nativeStatusCache.set(cacheKey, hit);
+  return hit;
+}
+
+// A plant's native/invasive status for the user's region: the user's own choice (plant.nativeStatus)
+// wins, otherwise the reference list. `regionCode` is a NATIVE_REGIONS key (or ""). Returns
+// { status, source, matchKey } — status is a key of NATIVE_STATUS or null when nothing is known.
+function getNativeStatus(plant, regionCode) {
+  if (plant && plant.nativeStatus && NATIVE_STATUS[plant.nativeStatus]) return { status: plant.nativeStatus, source: "you", matchKey: null };
+  const ref = referenceNativeStatus(plant && plant.name, regionCode);
+  return ref.status ? { status: ref.status, source: "reference", matchKey: ref.matchKey } : { status: null, source: null, matchKey: null };
 }
 
 // The growing year an archived entry is FOR. Archive labels are free text ("2025", "Summer 2025"),
@@ -2101,7 +3190,39 @@ function migrateBackgroundImages(data) {
 // into migratePlant for each of its plants. Returns the bed completely unchanged (same object
 // reference) when nothing needs fixing, so this is cheap to call on every load without forcing
 // needless re-renders.
+// Rounds a measurement in feet to at most 2 decimals (drag-resizing produces long floats like 4.0714285).
+function roundFt(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+// Formats a measurement in feet for display: at most 2 decimals, no trailing zeros ("4", "4.5", "4.07").
+function fmtFt(n) {
+  return String(roundFt(n));
+}
+
+// Brings a saved bed up to the current shape (see migrateBedCore) and tidies its stored size, position
+// and spacing boxes to 2 decimals, so beds saved before the rounding existed don't keep long fractions.
 function migrateBed(bed) {
+  const b = migrateBedCore(bed);
+  const w = roundFt(b.widthFt);
+  const l = roundFt(b.lengthFt);
+  const bx = roundFt(b.x);
+  const by = roundFt(b.y);
+  // Spacing boxes: size, position and spacing to 2 decimals too (plant positions themselves are left as generated).
+  let boxesChanged = false;
+  const boxes = (b.plantBoxes || []).map((bo) => {
+    const r = { ...bo, x: roundFt(bo.x), y: roundFt(bo.y), widthFt: roundFt(bo.widthFt), heightFt: roundFt(bo.heightFt), spacingIn: roundFt(bo.spacingIn) };
+    if (r.x !== bo.x || r.y !== bo.y || r.widthFt !== bo.widthFt || r.heightFt !== bo.heightFt || r.spacingIn !== bo.spacingIn) {
+      boxesChanged = true;
+      return r;
+    }
+    return bo;
+  });
+  if (w === b.widthFt && l === b.lengthFt && bx === b.x && by === b.y && !boxesChanged) return b;
+  return { ...b, widthFt: w, lengthFt: l, x: bx, y: by, plantBoxes: boxesChanged ? boxes : b.plantBoxes };
+}
+
+function migrateBedCore(bed) {
   // Every plant brought up to the current shape; reused as-is when nothing needed changing.
   const migratedPlants = (bed.plants || []).map((p, i) => migratePlant(p, i, bed));
   // "Irregular" was removed as a shape option (redundant with Custom); fold any existing beds
@@ -2179,8 +3300,8 @@ function computeDimensions(v) {
       customPoints: v.existingCustomPoints || null,
     };
   }
-  const widthFt = Math.max(1, Number(v.width) || 1);
-  const lengthFt = Math.max(1, Number(v.length) || 1);
+  const widthFt = roundFt(Math.max(1, Number(v.width) || 1));
+  const lengthFt = roundFt(Math.max(1, Number(v.length) || 1));
   return { widthFt, lengthFt, approxSqFt: Math.round(widthFt * lengthFt), customPoints: null };
 }
 
@@ -2190,8 +3311,8 @@ function bedToFormValues(bed) {
   return {
     name: bed.name,
     shape: bed.shape,
-    width: bed.widthFt,
-    length: bed.lengthFt,
+    width: roundFt(bed.widthFt),
+    length: roundFt(bed.lengthFt),
     approxSqFt: bed.approxSqFt,
     existingCustomPoints: bed.shape === "custom_points" ? bed.customPoints : null,
     soilType: bed.soilType,
@@ -2259,7 +3380,7 @@ function BedFields({ values, setValues, onDrawShape, hasCustomShape, nameError }
         <div>
           {hasCustomShape && (
             <p className="text-xs text-stone-500 mb-1.5">
-              Current shape: ~{values.approxSqFt} sq ft · {values.width}ft × {values.length}ft box
+              Current shape: ~{values.approxSqFt} sq ft · {fmtFt(values.width)}ft × {fmtFt(values.length)}ft box
             </p>
           )}
           <button
@@ -2382,17 +3503,21 @@ function BedFields({ values, setValues, onDrawShape, hasCustomShape, nameError }
 // lock/group state. Shared between bed-plants and freestanding ones (isBedPlant switches a few
 // bed-specific bits, like the eject/release actions, on or off). Saving here is the only place
 // these fields get edited — nothing else in the app writes to a plant's light/water/temp/cultivar.
-function PlantDetailsModal({ plantName, initialValues, zone, neighborPlants, livePlantIds, bedName, yearHistory, isBedPlant, onCancel, onSave, onEject, onDelete, onReleaseFromGroup }) {
+function PlantDetailsModal({ plantName, initialValues, zone, nativeRegion, stateCode, neighborPlants, livePlantIds, bedName, yearHistory, isBedPlant, onCancel, onSave, onEject, onDelete, onReleaseFromGroup }) {
   const [name, setName] = useState(plantName); // name field
   const [locked, setLocked] = useState(initialValues.locked || false); // locked plants can't be dragged
   const [light, setLight] = useState(initialValues.light || "unknown"); // sun need ("recommended" resolves from the plant name)
   const [water, setWater] = useState(initialValues.water || "unknown"); // water need
   const [temp, setTemp] = useState(initialValues.temp || "unknown"); // temperature tolerance
   const [cultivar, setCultivar] = useState(initialValues.cultivar || ""); // specific variety (e.g. "Nantes"); plants with different cultivars are listed separately
+  const [nativeStatus, setNativeStatus] = useState(initialValues.nativeStatus || ""); // user override of the native/invasive status ("" = use the reference list)
   const [companionNotes, setCompanionNotes] = useState(initialValues.companionNotes || ""); // user's own companion-planting notes
   const [companionWarningsDismissed, setCompanionWarningsDismissed] = useState(initialValues.companionWarningsDismissed || false); // hide companion-planting warnings for this plant
   const [rotationWarningsDismissed, setRotationWarningsDismissed] = useState(initialValues.rotationWarningsDismissed || false); // hide crop-rotation warnings for this plant
 
+  const regionLabel = nativeRegion ? NATIVE_REGIONS[nativeRegion] : ""; // name of the reference region in use ("" = none set)
+  const refStatus = getNativeStatus({ name: plantName }, nativeRegion); // what the reference list says for this plant name
+  const shownStatus = nativeStatus ? { status: nativeStatus } : refStatus; // the override if one is chosen, else the reference result
   const suggestion = getPlantingSuggestion(plantName, zone);
   // Free-text indoor-start window, defaulting to a suggestion based on the plant name and hardiness zone.
   const [plantingStartIndoors, setPlantingStartIndoors] = useState(
@@ -2469,6 +3594,27 @@ function PlantDetailsModal({ plantName, initialValues, zone, neighborPlants, liv
           </div>
         )}
         <div className="space-y-3">
+          {/* Native / invasive status: shows what the reference list says for this plant's name, with a per-plant override */}
+          <div>
+            <label className="text-xs mono-label text-stone-500 block mb-1">Native / invasive status</label>
+            <select
+              value={nativeStatus}
+              onChange={(e) => setNativeStatus(e.target.value)}
+              className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              <option value="">Automatic (from plant name){refStatus.status ? ` — ${NATIVE_STATUS[refStatus.status].label}` : " — not in the reference list"}</option>
+              {Object.entries(NATIVE_STATUS).map(([k, v]) => (
+                <option key={k} value={k}>{v.label}</option>
+              ))}
+            </select>
+            {shownStatus.status ? (
+              <p className={`text-xs mt-1 ${shownStatus.status === "invasive" ? "text-red-700" : shownStatus.status === "aggressive" ? "text-amber-700" : "text-stone-500"}`}>
+                {NATIVE_STATUS[shownStatus.status].note}
+              </p>
+            ) : (
+              <p className="text-xs text-stone-400 mt-1">No data for this plant name{regionLabel ? ` in the ${regionLabel} list` : ""} — pick a status yourself if you know it.</p>
+            )}
+          </div>
           <div>
             <label className="text-xs mono-label text-stone-500 block mb-1">Cultivar / variety (optional)</label>
             <input
@@ -2652,6 +3798,7 @@ function PlantDetailsModal({ plantName, initialValues, zone, neighborPlants, liv
                 light,
                 water,
                 temp,
+                nativeStatus,
                 cultivar: cultivar.trim(),
                 plantingStartIndoors: plantingStartIndoors.trim(),
                 plantingOutside: plantingOutside.trim(),
@@ -2945,6 +4092,7 @@ function useStableHandlers(handlers) {
 // state (hover/pinned, the fill tool's open/closed toggle, the marquee's current rectangle).
 function BedCard({
   bed,
+  nativeRegion, // reference region code for native/invasive lookups ("" = not set)
   lightZones,
   renaming,
   setRenaming,
@@ -3028,8 +4176,24 @@ function BedCard({
     window.addEventListener("touchmove", onMove, { passive: false });
     window.addEventListener("touchend", onEnd);
   };
-  const [pinned, setPinned] = useState(false); // details panel is pinned open by a click
+  const [pinned, setPinned] = useState(false); // details panel is pinned open by a click inside the bed (or its info button)
   const showDetails = hovering || pinned;
+  const rootRef = useRef(null); // the bed's outermost element — used to tell "clicked inside this bed" from "clicked elsewhere"
+  // While pinned, a press anywhere outside this bed (empty map, another bed, the sidebar...) unpins it.
+  // Presses inside the bed — including its details card — keep it open. Modals the card opens
+  // render elsewhere, so using one of them also closes the pin, which is fine: the card has done its job.
+  useEffect(() => {
+    if (!pinned) return undefined;
+    const onOutside = (e) => {
+      if (rootRef.current && !rootRef.current.contains(e.target)) setPinned(false);
+    };
+    document.addEventListener("mousedown", onOutside);
+    document.addEventListener("touchstart", onOutside);
+    return () => {
+      document.removeEventListener("mousedown", onOutside);
+      document.removeEventListener("touchstart", onOutside);
+    };
+  }, [pinned]);
   // Sorted once per render and reused for every plant's rotation check below, instead of each
   // plant re-sorting the same yearHistory array from scratch.
   const sortedYearHistory = useMemo(() => sortYearHistory(yearHistory), [yearHistory]);
@@ -3050,10 +4214,20 @@ function BedCard({
         mismatchReason: lightMismatch(bed.sunExposure, resolveNeedValue(p.light, p.name, "light")),
         companion: p.companionWarningsDismissed ? { goodNeighbors: [], badNeighbors: [] } : getCompanionRelations(p, bed.plants),
         rotationWarning: p.rotationWarningsDismissed ? null : getRotationWarning(bed.name, p.name, sortedYearHistory, livePlantIds),
+        nativeStatus: getNativeStatus(p, nativeRegion).status, // native / non_native / aggressive / invasive / null — drives the dot colour
       });
     });
     return byPlantId;
-  }, [bed.plants, bed.sunExposure, bed.name, sortedYearHistory, livePlantIds]);
+  }, [bed.plants, bed.sunExposure, bed.name, sortedYearHistory, livePlantIds, nativeRegion]);
+
+  // Counts for the details card: how many of this bed's plants are native / invasive / aggressive.
+  const nativeCounts = useMemo(() => {
+    const c = { native: 0, aggressive: 0, invasive: 0 };
+    plantWarnings.forEach((w) => {
+      if (c[w.nativeStatus] !== undefined) c[w.nativeStatus] += 1;
+    });
+    return c;
+  }, [plantWarnings]);
 
   const soil = SOIL_TYPES[bed.soilType] || SOIL_TYPES.unknown;
   const locationLabel = YARD_LOCATIONS[bed.yardLocation] || YARD_LOCATIONS.unknown;
@@ -3073,8 +4247,8 @@ function BedCard({
     bed.shape === "custom_points"
       ? `~${bed.approxSqFt} sq ft`
       : bed.shape === "circle_oval"
-      ? `⌀${bed.widthFt}ft × ${bed.lengthFt}ft`
-      : `${bed.widthFt}ft × ${bed.lengthFt}ft`;
+      ? `⌀${fmtFt(bed.widthFt)}ft × ${fmtFt(bed.lengthFt)}ft`
+      : `${fmtFt(bed.widthFt)}ft × ${fmtFt(bed.lengthFt)}ft`;
   // Drawn at exactly true scale — the same size the app uses for every limit on this bed (where a
   // plant can be dragged, how big a box can grow, whether a spot counts as inside the bed). This
   // used to enforce a minimum drawn size of 170x100px so small beds stayed readable back when the
@@ -3089,16 +4263,26 @@ function BedCard({
 
   return (
     <div
+      ref={rootRef}
       className="absolute"
       style={{ left: bed.x, top: bed.y, width: boxWidthPx, minHeight: boxHeightPx }}
       onMouseEnter={() => setHovering(true)}
       onMouseLeave={() => setHovering(false)}
+      // Pressing anywhere inside the bed (empty soil, a plant, a handle, the label) pins its title
+      // and details card open until something outside the bed is pressed. Elements that stop
+      // propagation (the info button, which toggles the pin itself) are unaffected.
+      onMouseDown={() => setPinned(true)}
+      onTouchStart={() => setPinned(true)}
     >
       {/* Label lives entirely outside the shape now — name/size text was getting cramped or cut off
           when squeezed inside small or oddly-shaped beds. This is also the drag handle. */}
+      {/* Shown only while hovering or pinned — same rule as the details card. The 6px gap above the
+          pill is padding on a wrapper (not a margin) so the pointer never leaves the bed while moving up to it. */}
+      {showDetails && (
+      <div className="absolute z-10" style={{ bottom: "100%", left: 0, paddingBottom: 6 }}>
       <div
-        className="absolute z-10 flex items-center gap-1.5 bg-white border border-stone-300 rounded-full shadow-sm px-2.5 py-1 cursor-grab active:cursor-grabbing"
-        style={{ bottom: "100%", left: 0, marginBottom: 6, whiteSpace: "nowrap" }}
+        className="flex items-center gap-1.5 bg-white border border-stone-300 rounded-full shadow-sm px-2.5 py-1 cursor-grab active:cursor-grabbing"
+        style={{ whiteSpace: "nowrap" }}
         onMouseDown={(e) => startDrag("bed", bed.id, e)}
         onTouchStart={(e) => startDrag("bed", bed.id, e)}
       >
@@ -3116,6 +4300,8 @@ function BedCard({
           <Info size={14} className="text-stone-600" />
         </button>
       </div>
+      </div>
+      )}
 
       {isCustom && (
         <svg
@@ -3129,6 +4315,9 @@ function BedCard({
       )}
       <div
         className={`relative shadow-md border-2 ${soil.border} ${!isCustom ? `${soil.swatch} soil-texture` : "bg-transparent"} flex flex-col overflow-hidden`}
+        // The bed's own border/background also moves it when dragged (the interior has its own handler below).
+        onMouseDown={(e) => { if (e.target === e.currentTarget) startDrag("bed", bed.id, e); }}
+        onTouchStart={(e) => { if (e.target === e.currentTarget) startDrag("bed", bed.id, e); }}
         style={{
           width: "100%",
           minHeight: boxHeightPx,
@@ -3144,9 +4333,13 @@ function BedCard({
             origin) rather than a flowing list — this container just needs to be a positioned parent
             for them, sized to the bed's own footprint. */}
         <div
-          className={`relative h-full ${selectionModeBedId === bed.id ? "cursor-crosshair" : ""}`}
-          onMouseDown={selectionModeBedId === bed.id ? (e) => startMarquee(bed.id, e) : undefined}
-          onTouchStart={selectionModeBedId === bed.id ? (e) => startMarquee(bed.id, e) : undefined}
+          // flex-1 makes this fill the whole bed (its parent is a flex column sized by minHeight, where h-full alone collapses to the content height) — that is what centres the "No plants yet" note
+          className={`relative h-full flex-1 ${selectionModeBedId === bed.id ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing"}`}
+          // Selection mode: dragging empty space draws a selection rectangle. Otherwise dragging empty
+          // space moves the whole bed (the target check keeps clicks on plants, spacing boxes and
+          // their handles — which run their own drags — from also moving the bed).
+          onMouseDown={selectionModeBedId === bed.id ? (e) => startMarquee(bed.id, e) : (e) => { if (e.target === e.currentTarget) startDrag("bed", bed.id, e); }}
+          onTouchStart={selectionModeBedId === bed.id ? (e) => startMarquee(bed.id, e) : (e) => { if (e.target === e.currentTarget) startDrag("bed", bed.id, e); }}
         >
           {(bed.plantBoxes || []).map((box) => {
             const linkedPartner = box.linkedBoxId ? (bed.plantBoxes || []).find((b) => b.id === box.linkedBoxId) : null;
@@ -3197,7 +4390,7 @@ function BedCard({
                 key={box.id}
                 onMouseDown={inSelectionMode ? undefined : (e) => startPlantBoxDrag(bed.id, box.id, e)}
                 onTouchStart={inSelectionMode ? undefined : (e) => startPlantBoxDrag(bed.id, box.id, e)}
-                title={`${box.plantName} spacing box (${box.spacingIn}in)${linkedPartner ? ` + ${linkedPartner.plantName} spacing box (${linkedPartner.spacingIn}in)` : ""}${note ? ` — ${note}` : ""}`}
+                title={`${box.plantName} spacing box (${fmtFt(box.spacingIn)}in)${linkedPartner ? ` + ${linkedPartner.plantName} spacing box (${fmtFt(linkedPartner.spacingIn)}in)` : ""}${note ? ` — ${note}` : ""}`}
                 className={`absolute border-2 ${linkedPartner ? "border-solid" : "border-dashed"} rounded bg-blue-500/5 ${borderClass} ${inSelectionMode ? "" : "cursor-grab active:cursor-grabbing"}`}
                 style={{
                   left: box.x * FT_TO_PX,
@@ -3294,14 +4487,15 @@ function BedCard({
             const inSelectionMode = selectionModeBedId === bed.id;
             const isSelected = selectedPlantIds.has(p.id);
             // Looked up from the per-bed cache (plantWarnings, above) rather than recomputed here.
-            const { mismatchReason, companion, rotationWarning } = plantWarnings.get(p.id);
+            const { mismatchReason, companion, rotationWarning, nativeStatus } = plantWarnings.get(p.id);
+            const nativeInfo = nativeStatus && nativeStatus !== "non_native" ? NATIVE_STATUS[nativeStatus] : null; // non-native crops are the norm — only call out the notable statuses
             const warningText =
               mismatchReason ||
               (companion.badNeighbors.length > 0 ? `Traditionally avoided near: ${companion.badNeighbors.join(", ")} (this bed).` : null) ||
               (rotationWarning ? `Grew ${rotationWarning.matchedPlant} (also a ${rotationWarning.family}) here in ${rotationWarning.year}.` : null);
             const dotTitle = inSelectionMode
               ? `${p.name}${p.cultivar ? ` (${p.cultivar})` : ""} — click to ${isSelected ? "deselect" : "select"}`
-              : `${p.name}${p.cultivar ? ` (${p.cultivar})` : ""}${p.locked ? " — locked" : ""}${warningText ? ` — ${warningText}` : ""} — click for details`;
+              : `${p.name}${p.cultivar ? ` (${p.cultivar})` : ""}${p.locked ? " — locked" : ""}${nativeInfo ? ` — ${nativeInfo.label.toLowerCase()}` : ""}${warningText ? ` — ${warningText}` : ""} — click for details`;
             // Matches the fill-tool's own preview formula exactly, so a plant's dot renders at the
             // same size once placed as it showed while still being dragged — clamped so a tightly
             // spaced plant (e.g. carrots at 3in) stays clickable and a widely spaced one (e.g.
@@ -3320,7 +4514,7 @@ function BedCard({
                     : undefined
                 }
                 title={dotTitle}
-                className={`absolute rounded-full shadow bg-emerald-600 border-2 cursor-pointer ${
+                className={`absolute rounded-full shadow ${nativeInfo ? nativeInfo.dot : "bg-emerald-600"} border-2 cursor-pointer ${
                   isSelected ? "border-blue-500 ring-2 ring-blue-400 ring-offset-1" : warningText ? "border-red-500" : "border-white"
                 } ${!inSelectionMode && !p.locked ? "cursor-grab active:cursor-grabbing" : ""}`}
                 style={{
@@ -3440,6 +4634,22 @@ function BedCard({
             </button>
           </div>
           <div className="flex flex-wrap gap-1">
+            {/* Native / invasive summary for this bed's plants (only shown when there is something to report) */}
+            {nativeCounts.native > 0 && (
+              <div className={`inline-flex items-center gap-1 text-xs mono-label border rounded-full px-2 py-0.5 ${NATIVE_STATUS.native.pill}`} title="Plants in this bed that are native to the region">
+                {nativeCounts.native} of {bed.plants.length} native
+              </div>
+            )}
+            {nativeCounts.invasive > 0 && (
+              <div className={`inline-flex items-center gap-1 text-xs mono-label border rounded-full px-2 py-0.5 ${NATIVE_STATUS.invasive.pill}`} title={NATIVE_STATUS.invasive.note}>
+                <AlertTriangle size={10} /> {nativeCounts.invasive} invasive
+              </div>
+            )}
+            {nativeCounts.aggressive > 0 && (
+              <div className={`inline-flex items-center gap-1 text-xs mono-label border rounded-full px-2 py-0.5 ${NATIVE_STATUS.aggressive.pill}`} title={NATIVE_STATUS.aggressive.note}>
+                {nativeCounts.aggressive} spreads aggressively
+              </div>
+            )}
             <div className="inline-flex items-center gap-1 text-xs mono-label text-stone-500 bg-stone-100 border border-stone-300 rounded-full px-2 py-0.5">
               <MapPin size={10} /> {locationLabel}
             </div>
@@ -3771,6 +4981,9 @@ export default function GardenPlanner() {
   const [journalEntries, setJournalEntries] = useState([]); // harvest/notes/expense log entries
   // Calendar year the succession plans are computed for (shared by the Seeds and Calendar tabs). Defaults to next year once September arrives — when next season gets planned. View-only, not saved.
   const [seedPlanYear, setSeedPlanYear] = useState(new Date().getMonth() >= 8 ? new Date().getFullYear() + 1 : new Date().getFullYear());
+  const [stateCode, setStateCode] = useState(""); // US state the garden is in ("" = not set); picks the native/invasive reference region. Saved + backed up, not part of undo/redo
+  const nativeRegion = STATE_TO_REGION[stateCode] || ""; // reference region for native/invasive lookups, derived from the chosen state
+  const [pantryItems, setPantryItems] = useState([]); // preserved food items (canned/frozen/dried...) with stock counts; saved + backed up, not part of undo/redo
   const [seedPacks, setSeedPacks] = useState([]); // seed inventory packets, each with its own succession-plan settings (saved + backed up, but not part of undo/redo)
   const [showYearRollover, setShowYearRollover] = useState(false); // whether the "start a new year" dialog is open
   const [zoneForm, setZoneForm] = useState({ sunExposure: "full_sun", customShape: null });
@@ -3780,7 +4993,7 @@ export default function GardenPlanner() {
   const [bedForm, setBedForm] = useState(blankFormValues()); // sidebar "Add a bed" form values
   const [bedNameError, setBedNameError] = useState(false); // show the "bed name required" message
   const [legendOpen, setLegendOpen] = useState(false); // whether the Gantt legend is expanded
-  const [activeTab, setActiveTab] = useState("map"); // current tab: "map" | "calendar" | "history" | "journal" | "seeds"
+  const [activeTab, setActiveTab] = useState("map"); // current tab: "map" | "calendar" | "history" | "journal" | "seeds" | "pantry"
   const [zoom, setZoom] = useState(1); // map zoom factor (1 = 100%); view-only, not saved or undoable
   const [baseWidth, setBaseWidth] = useState(800); // measured width of the map viewport in px (updated by a ResizeObserver)
   const [baseHeight, setBaseHeight] = useState(400); // measured height of the map viewport in px
@@ -3835,6 +5048,8 @@ export default function GardenPlanner() {
           setYearHistory(data.yearHistory || []);
           setJournalEntries(data.journalEntries || []);
           setSeedPacks(Array.isArray(data.seedPacks) ? data.seedPacks : []);
+          setPantryItems(Array.isArray(data.pantryItems) ? data.pantryItems : []);
+          setStateCode(US_STATES[data.stateCode] ? data.stateCode : "");
           setBackgroundImages(migrateBackgroundImages(data));
         }
       } catch (e) {
@@ -3849,7 +5064,7 @@ export default function GardenPlanner() {
   // write fails (almost always a storage-quota issue caused by large images), so a garden's
   // actual data never gets lost just because an image didn't fit.
   const persist = useCallback(
-    async (nextBeds, nextPlants, nextZone, nextZoneCustomText, nextLightZones, nextSiteFeatures, nextYearHistory, nextJournalEntries, nextBackgroundImages, nextSeedPacks) => {
+    async (nextBeds, nextPlants, nextZone, nextZoneCustomText, nextLightZones, nextSiteFeatures, nextYearHistory, nextJournalEntries, nextBackgroundImages, nextSeedPacks, nextPantryItems, nextStateCode) => {
       const basePayload = {
         beds: nextBeds,
         plants: nextPlants,
@@ -3860,6 +5075,8 @@ export default function GardenPlanner() {
         yearHistory: nextYearHistory,
         journalEntries: nextJournalEntries,
         seedPacks: nextSeedPacks || [],
+        pantryItems: nextPantryItems || [],
+        stateCode: nextStateCode || "",
       };
       try {
         await window.storage.set(STORAGE_KEY, JSON.stringify({ ...basePayload, backgroundImages: nextBackgroundImages }));
@@ -3998,8 +5215,8 @@ export default function GardenPlanner() {
   // (just an object assignment, no serialization) on every relevant change.
   const latestSaveDataRef = useRef(null);
   useEffect(() => {
-    latestSaveDataRef.current = { beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks };
-  }, [beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks]);
+    latestSaveDataRef.current = { beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks, pantryItems, stateCode };
+  }, [beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks, pantryItems]);
 
   // Debounced so a fast-changing drag (a bed, plant, or image moving through dozens of positions a
   // second) doesn't trigger a full JSON.stringify-and-write on every single intermediate step — only
@@ -4011,12 +5228,12 @@ export default function GardenPlanner() {
     if (!loaded) return;
     persistTimeoutRef.current = setTimeout(() => {
       persistTimeoutRef.current = null;
-      persist(beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks);
+      persist(beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks, pantryItems, stateCode);
     }, 500);
     return () => {
       if (persistTimeoutRef.current) clearTimeout(persistTimeoutRef.current);
     };
-  }, [beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks, loaded, persist]);
+  }, [beds, plants, zone, zoneCustomText, lightZones, siteFeatures, yearHistory, journalEntries, backgroundImages, seedPacks, pantryItems, stateCode, loaded, persist]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -4025,7 +5242,7 @@ export default function GardenPlanner() {
       clearTimeout(persistTimeoutRef.current);
       persistTimeoutRef.current = null;
       const d = latestSaveDataRef.current;
-      if (d) persist(d.beds, d.plants, d.zone, d.zoneCustomText, d.lightZones, d.siteFeatures, d.yearHistory, d.journalEntries, d.backgroundImages, d.seedPacks);
+      if (d) persist(d.beds, d.plants, d.zone, d.zoneCustomText, d.lightZones, d.siteFeatures, d.yearHistory, d.journalEntries, d.backgroundImages, d.seedPacks, d.pantryItems, d.stateCode);
     };
     const onVisibilityChange = () => {
       if (document.hidden) flushIfPending();
@@ -4080,9 +5297,20 @@ export default function GardenPlanner() {
   // Seed inventory handlers (used by the Seeds tab). Packets are plain objects in seedPacks; updates merge a patch by id.
   const addSeedPack = (pack) => setSeedPacks((list) => [...list, pack]);
   const updateSeedPack = (id, patch) => setSeedPacks((list) => list.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  // Pantry handlers (used by the Pantry tab), same shape as the seed ones.
+  const addPantryItem = (p) => setPantryItems((list) => [...list, p]);
+  const updatePantryItem = (id, patch) => setPantryItems((list) => list.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  const deletePantryItem = (id) => setPantryItems((list) => list.filter((p) => p.id !== id));
   const deleteSeedPack = (id) => setSeedPacks((list) => list.filter((p) => p.id !== id));
   // Crop names offered as suggestions when adding seeds: every crop with planting timing data, capitalised.
   const seedCropOptions = useMemo(() => Object.keys(PLANT_REFERENCE).map((k) => k.charAt(0).toUpperCase() + k.slice(1)), []);
+  // Crop suggestions for the pantry's "from crop" field: crops with timing data plus anything already harvested or in the garden.
+  const pantryCropOptions = useMemo(() => {
+    const names = new Set(seedCropOptions);
+    journalEntries.forEach((e) => e.plantName && names.add(e.plantName.trim()));
+    plants.forEach((p) => p.name && names.add(p.name.trim()));
+    return Array.from(names).filter(Boolean).sort();
+  }, [seedCropOptions, journalEntries, plants]);
 
   // Mouse-wheel zoom over "Your land", anchored on the cursor: the map point under the pointer
   // stays under the pointer as the scale changes (like a map app), instead of zooming about the
@@ -4421,6 +5649,9 @@ export default function GardenPlanner() {
       setZipStatus("error");
       return;
     }
+    // The state comes straight from the ZIP code (no network needed), so set it even if the zone lookup below fails.
+    const zipState = stateFromZip(zip);
+    if (zipState) setStateCode(zipState);
     setZipStatus("loading");
     try {
       const res = await fetch(`https://phzmapi.org/${zip}.json`);
@@ -4442,7 +5673,7 @@ export default function GardenPlanner() {
     const payload = {
       exportedAt: new Date().toISOString(),
       app: "Homestead Bed Planner",
-      version: 7,
+      version: 9,
       beds,
       plants,
       zone,
@@ -4452,6 +5683,8 @@ export default function GardenPlanner() {
       yearHistory,
       journalEntries,
       seedPacks,
+      pantryItems,
+      stateCode,
       backgroundImages,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -4500,6 +5733,8 @@ export default function GardenPlanner() {
         setYearHistory(Array.isArray(data.yearHistory) ? data.yearHistory : []);
         setJournalEntries(Array.isArray(data.journalEntries) ? data.journalEntries : []);
         setSeedPacks(Array.isArray(data.seedPacks) ? data.seedPacks : []);
+        setPantryItems(Array.isArray(data.pantryItems) ? data.pantryItems : []);
+          setStateCode(US_STATES[data.stateCode] ? data.stateCode : "");
         setBackgroundImages(migrateBackgroundImages(data));
         setImportError("");
       } catch (err) {
@@ -4597,6 +5832,11 @@ export default function GardenPlanner() {
   // Journal helpers: add a new entry (stamped with an id and creation time) or delete one by id.
   function addJournalEntry(entry) {
     setJournalEntries((prev) => [...prev, { id: nextId(), createdAt: new Date().toISOString(), ...entry }]);
+  }
+
+  // Merges edited fields into an existing journal entry (keeps its id and createdAt).
+  function updateJournalEntry(id, patch) {
+    setJournalEntries((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
   }
 
   function deleteJournalEntry(id) {
@@ -4894,8 +6134,8 @@ export default function GardenPlanner() {
         maxMovementPx = Math.max(maxMovementPx, Math.hypot(moveClientX - state.startClientX, moveClientY - state.startClientY));
         const deltaXFt = (moveClientX - state.startClientX) / zoom / FT_TO_PX;
         const deltaYFt = (moveClientY - state.startClientY) / zoom / FT_TO_PX;
-        const x = Math.max(0, Math.min(state.bedWidthFt, state.startX + deltaXFt));
-        const y = Math.max(0, Math.min(state.bedLengthFt, state.startY + deltaYFt));
+        const x = roundFt(Math.max(0, Math.min(state.bedWidthFt, state.startX + deltaXFt)));
+        const y = roundFt(Math.max(0, Math.min(state.bedLengthFt, state.startY + deltaYFt)));
         const stillInsideBox = !box || (x >= box.x && x <= box.x + box.widthFt && y >= box.y && y <= box.y + box.heightFt);
         setBeds((prev) =>
           prev.map((b) =>
@@ -4985,8 +6225,8 @@ export default function GardenPlanner() {
         const deltaYFt = (moveClientY - state.startClientY) / zoom / FT_TO_PX;
         const maxX = Math.max(0, state.bedWidthFt - state.boxWidthFt);
         const maxY = Math.max(0, state.bedLengthFt - state.boxHeightFt);
-        const newBoxX = Math.max(0, Math.min(maxX, state.startBoxX + deltaXFt));
-        const newBoxY = Math.max(0, Math.min(maxY, state.startBoxY + deltaYFt));
+        const newBoxX = roundFt(Math.max(0, Math.min(maxX, state.startBoxX + deltaXFt)));
+        const newBoxY = roundFt(Math.max(0, Math.min(maxY, state.startBoxY + deltaYFt)));
         const clampedDeltaX = newBoxX - state.startBoxX;
         const clampedDeltaY = newBoxY - state.startBoxY;
         const memberMap = new Map(state.memberStartPositions.map((m) => [m.id, m]));
@@ -5001,7 +6241,7 @@ export default function GardenPlanner() {
                   ),
                   plants: b.plants.map((p) => {
                     const start = memberMap.get(p.id);
-                    return start ? { ...p, x: start.x + clampedDeltaX, y: start.y + clampedDeltaY } : p;
+                    return start ? { ...p, x: roundFt(start.x + clampedDeltaX), y: roundFt(start.y + clampedDeltaY) } : p;
                   }),
                 }
           )
@@ -5043,8 +6283,8 @@ export default function GardenPlanner() {
         const deltaYFt = (moveClientY - state.startClientY) / zoom / FT_TO_PX;
         const maxWidthFt = state.bedWidthFt - state.boxX;
         const maxHeightFt = state.bedLengthFt - state.boxY;
-        const newWidthFt = Math.min(maxWidthFt, Math.max(spacingFt, state.startWidthFt + deltaXFt));
-        const newHeightFt = Math.min(maxHeightFt, Math.max(spacingFt, state.startHeightFt + deltaYFt));
+        const newWidthFt = roundFt(Math.min(maxWidthFt, Math.max(spacingFt, state.startWidthFt + deltaXFt)));
+        const newHeightFt = roundFt(Math.min(maxHeightFt, Math.max(spacingFt, state.startHeightFt + deltaYFt)));
         setBeds((prev) =>
           prev.map((b) => {
             if (b.id !== bedId) return b;
@@ -5095,8 +6335,8 @@ export default function GardenPlanner() {
           const maxHeightFt = state.bedLengthFt - state.boxY;
           return {
             ...prev,
-            boxWidthFt: Math.min(maxWidthFt, Math.max(startSizeFt, state.startWidthFt + deltaXFt)),
-            boxHeightFt: Math.min(maxHeightFt, Math.max(startSizeFt, state.startHeightFt + deltaYFt)),
+            boxWidthFt: roundFt(Math.min(maxWidthFt, Math.max(startSizeFt, state.startWidthFt + deltaXFt))),
+            boxHeightFt: roundFt(Math.min(maxHeightFt, Math.max(startSizeFt, state.startHeightFt + deltaYFt))),
           };
         });
       },
@@ -5122,7 +6362,7 @@ export default function GardenPlanner() {
         const deltaYFt = (moveClientY - state.startClientY) / zoom / FT_TO_PX;
         const maxX = Math.max(0, state.bedWidthFt - prev.boxWidthFt);
         const maxY = Math.max(0, state.bedLengthFt - prev.boxHeightFt);
-        return { ...prev, boxX: Math.min(maxX, Math.max(0, state.startBoxX + deltaXFt)), boxY: Math.min(maxY, Math.max(0, state.startBoxY + deltaYFt)) };
+        return { ...prev, boxX: roundFt(Math.min(maxX, Math.max(0, state.startBoxX + deltaXFt))), boxY: roundFt(Math.min(maxY, Math.max(0, state.startBoxY + deltaYFt))) };
       });
     }, null);
   };
@@ -5147,8 +6387,8 @@ export default function GardenPlanner() {
           const maxHeightFt = state.bedLengthFt - state.boxY;
           return {
             ...prev,
-            boxWidthFt: Math.min(maxWidthFt, Math.max(spacingFt, state.startWidthFt + deltaXFt)),
-            boxHeightFt: Math.min(maxHeightFt, Math.max(spacingFt, state.startHeightFt + deltaYFt)),
+            boxWidthFt: roundFt(Math.min(maxWidthFt, Math.max(spacingFt, state.startWidthFt + deltaXFt))),
+            boxHeightFt: roundFt(Math.min(maxHeightFt, Math.max(spacingFt, state.startHeightFt + deltaYFt))),
           };
         });
       },
@@ -5178,7 +6418,7 @@ export default function GardenPlanner() {
           const deltaIn = Math.abs(deltaXIn) > Math.abs(deltaYIn) ? deltaXIn : deltaYIn;
           const maxSpacingIn = Math.min(state.boxWidthFt, state.boxHeightFt) * 12;
           const MIN_SPACING_IN = 1;
-          return { ...prev, spacingIn: Math.min(maxSpacingIn, Math.max(MIN_SPACING_IN, state.startSpacingIn + deltaIn)) };
+          return { ...prev, spacingIn: roundFt(Math.min(maxSpacingIn, Math.max(MIN_SPACING_IN, state.startSpacingIn + deltaIn))) };
         });
       },
       null,
@@ -5440,8 +6680,8 @@ export default function GardenPlanner() {
         const { kind, id, offsetX, offsetY } = state;
         let x = (moveClientX - rect.left) / zoom - offsetX;
         let y = (moveClientY - rect.top) / zoom - offsetY;
-        x = Math.max(0, x);
-        y = Math.max(0, y);
+        x = roundFt(Math.max(0, x)); // canvas px, kept to 2 decimals like every other stored measurement
+        y = roundFt(Math.max(0, y));
         if (kind === "bed") setBeds((prev) => prev.map((b) => (b.id === id ? { ...b, x, y } : b)));
         else if (kind === "zone") setLightZones((prev) => prev.map((z) => (z.id === id ? { ...z, x, y } : z)));
         else if (kind === "feature") setSiteFeatures((prev) => prev.map((f) => (f.id === id ? { ...f, x, y } : f)));
@@ -5522,7 +6762,9 @@ export default function GardenPlanner() {
               y = Math.max(0, startY + deltaYFt * FT_TO_PX);
               lengthFt = Math.max(MIN_FT, (bottomEdgePx - y) / FT_TO_PX);
             }
-            return { ...bed, widthFt, lengthFt, x: Math.max(0, x), y: Math.max(0, y), approxSqFt: Math.round(widthFt * lengthFt) };
+            widthFt = roundFt(widthFt); // keep stored sizes to 2 decimals
+            lengthFt = roundFt(lengthFt);
+            return { ...bed, widthFt, lengthFt, x: roundFt(Math.max(0, x)), y: roundFt(Math.max(0, y)), approxSqFt: Math.round(widthFt * lengthFt) };
           })
         );
       },
@@ -5864,6 +7106,7 @@ export default function GardenPlanner() {
             plantName={found.name}
             initialValues={found}
             zone={zone}
+            nativeRegion={nativeRegion}
             neighborPlants={neighborPlants}
             livePlantIds={new Set((editingPlant.scope === "bed" ? beds.find((b) => b.id === editingPlant.bedId)?.plants || [] : []).map((p) => p.id))}
             bedName={bedName}
@@ -5935,6 +7178,22 @@ export default function GardenPlanner() {
             >
               {Object.entries(USDA_ZONES).map(([key, label]) => (
                 <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            <label className="text-xs text-stone-500" htmlFor="state-select">Your state:</label>
+            <select
+              id="state-select"
+              value={stateCode}
+              onChange={(e) => setStateCode(e.target.value)}
+              title="Used for native / invasive plant info. Entering a ZIP code fills this in."
+              className="text-sm border border-stone-300 rounded-lg px-2 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-600"
+            >
+              <option value="">Not set / outside US</option>
+              {Object.entries(US_STATES).map(([k, v]) => (
+                <option key={k} value={k}>{v}</option>
               ))}
             </select>
           </div>
@@ -6035,6 +7294,15 @@ export default function GardenPlanner() {
         >
           <Sprout size={15} /> Seeds
         </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab("pantry")}
+          className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-t-lg border border-b-0 -mb-px ${
+            activeTab === "pantry" ? "bg-white border-stone-300 text-emerald-700" : "bg-transparent border-transparent text-stone-500 hover:text-stone-700"
+          }`}
+        >
+          <Package size={15} /> Pantry
+        </button>
       </div>
 
       {/* Tab router: calendar / history / journal views, otherwise the main planner (sidebar + map) */}
@@ -6050,8 +7318,10 @@ export default function GardenPlanner() {
         />
       ) : activeTab === "seeds" ? (
         <SeedsView seedPacks={seedPacks} zone={zone} plantNames={seedCropOptions} planYear={seedPlanYear} setPlanYear={setSeedPlanYear} onAdd={addSeedPack} onUpdate={updateSeedPack} onDelete={deleteSeedPack} />
+      ) : activeTab === "pantry" ? (
+        <PantryView pantryItems={pantryItems} journalEntries={journalEntries} cropOptions={pantryCropOptions} onAdd={addPantryItem} onUpdate={updatePantryItem} onDelete={deletePantryItem} />
       ) : activeTab === "journal" ? (
-        <JournalView journalEntries={journalEntries} beds={beds} onAddEntry={addJournalEntry} onDeleteEntry={deleteJournalEntry} />
+        <JournalView journalEntries={journalEntries} beds={beds} onAddEntry={addJournalEntry} onUpdateEntry={updateJournalEntry} onDeleteEntry={deleteJournalEntry} />
       ) : (
       /* Main planner layout: sidebar of forms on the left, the "Your land" map on the right */
       <div className="mx-auto px-3 sm:px-4 md:px-6 py-4 sm:py-6 flex flex-col sm:flex-row gap-4 sm:gap-6">
@@ -6452,6 +7722,20 @@ export default function GardenPlanner() {
                     ))}
                   </div>
                 </div>
+                <div className="mb-3">
+                  <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">Plant dot colour</div>
+                  <div className="space-y-1.5">
+                    {[["non_native", "Other plants"], ["native", null], ["aggressive", null], ["invasive", null]].map(([k, text]) => (
+                      <div key={k} className="flex items-center gap-2 text-sm">
+                        <span className={`inline-block w-3.5 h-3.5 rounded-full border-2 border-white shadow ${NATIVE_STATUS[k].dot}`} />
+                        <span className="text-stone-700">{text || NATIVE_STATUS[k].label}</span>
+                      </div>
+                    ))}
+                    <p className="text-xs text-stone-400">Set per plant in its details window; {nativeRegion
+                      ? `showing the ${NATIVE_REGIONS[nativeRegion]} list — a starting point, so check your state's invasive species program.`
+                      : stateCode ? "no regional list for your state yet; only plants that spread everywhere are flagged." : "set your state in the header to see native and invasive info for your area."}</p>
+                  </div>
+                </div>
                 <div>
                   <div className="text-xs mono-label text-stone-400 mb-1.5 uppercase tracking-wide">Sun exposure (label only)</div>
                   <div className="space-y-1 text-sm text-stone-700">
@@ -6848,6 +8132,7 @@ export default function GardenPlanner() {
               <MemoBedCard
                 key={bed.id}
                 bed={bed}
+                nativeRegion={nativeRegion}
                 lightZones={lightZones}
                 renaming={renaming}
                 setRenaming={setRenaming}
@@ -7034,6 +8319,8 @@ export default function GardenPlanner() {
             {/* Layer: freestanding plants (not inside a bed) */}
             {plants.map((plant) => {
               const isRenaming = renaming && renaming.scope === "free" && renaming.plantId === plant.id;
+              const freeStatus = getNativeStatus(plant, nativeRegion).status; // native / invasive / aggressive colours the sprout icon
+              const freeStatusInfo = freeStatus && freeStatus !== "non_native" ? NATIVE_STATUS[freeStatus] : null;
               return (
                 <div
                   key={plant.id}
@@ -7042,7 +8329,11 @@ export default function GardenPlanner() {
                   onMouseDown={(e) => startDrag("plant", plant.id, e)}
                   onTouchStart={(e) => startDrag("plant", plant.id, e)}
                 >
-                  <Sprout size={13} className="text-emerald-700 shrink-0" />
+                  <Sprout
+                    size={13}
+                    className={`shrink-0 ${freeStatus === "native" ? "text-teal-600" : freeStatus === "invasive" ? "text-red-600" : freeStatus === "aggressive" ? "text-amber-600" : "text-emerald-700"}`}
+                    title={freeStatusInfo ? freeStatusInfo.label : undefined}
+                  />
                   {isRenaming ? (
                     <input
                       ref={renameInputRef}
